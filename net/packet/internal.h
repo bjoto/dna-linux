@@ -114,6 +114,7 @@ struct packet_sock {
 	struct packet_ring_buffer	rx_ring;
 	struct packet_ring_buffer	tx_ring;
 
+	bool			packet_zerocopy;
 	struct tp4_umem		*umem;
 
 	int			copy_thresh;

@@ -18,6 +18,7 @@
 #include <asm/barrier.h>
 #include <linux/if_packet.h>
 #include <linux/slab.h>
+#include <linux/dma-mapping.h>
 
 #define TP4_UMEM_MIN_FRAME_SIZE 2048
 #define TP4_UMEM_MIN_PACKET_DATA 1536
@@ -36,6 +37,11 @@ struct tp4_umem {
 	unsigned int data_headroom;
 };
 
+struct tp4_dma_info {
+	dma_addr_t dma;
+	struct page *page;
+};
+
 struct tp4_queue {
 	struct tpacket4_desc *vring;
 
@@ -45,7 +51,31 @@ struct tp4_queue {
 	unsigned int num_free;
 
 	struct tp4_umem *umem;
+	struct tp4_dma_info *dma_info;
+	enum dma_data_direction direction;
 	spinlock_t tx_lock; /* used in copy mode when completing from skb dtor */
+};
+
+enum tp4_netdev_command {
+	/* Enable the AF_PACKET V4 zerocopy support. When this is enabled,
+	 * packets will arrive to the socket without being copied resulting
+	 * in better performance. Note that this also means that no packets
+	 * are sent to the kernel stack after this feature has been enabled.
+	 */
+	TP4_ENABLE,
+	/* Disables the PACKET_ZEROCOPY support. */
+	TP4_DISABLE,
+};
+
+struct tp4_netdev_parms {
+	enum tp4_netdev_command command;
+
+	struct tp4_queue *tp4q_rx;
+	struct tp4_queue *tp4q_tx;
+	void (*readable)(void *);
+	void *readable_opaque;
+	void (*writable)(void *);
+	void *writable_opaque;
 };
 
 /**
@@ -308,10 +338,128 @@ static inline void tp4q_write_header(struct tp4_queue *tp4q,
 /**
  *
  **/
+static inline void tp4q_write_desc(struct tpacket4_desc *desc, u64 addr,
+				   u32 len)
+{
+	desc->addr = addr;
+	desc->len = len;
+	desc->flags = 0;
+	desc->error = 0;
+}
+
+/**
+ *
+ **/
 static inline void tp4q_set_error(struct tpacket4_desc *desc,
 				  int errno)
 {
 	desc->error = errno;
+}
+
+/**
+ *
+ **/
+static inline void tp4q_return_error(struct tp4_queue *tp4q, int errno)
+{
+	struct tpacket4_desc desc;
+	int ndescs;
+	int err;
+
+	ndescs = tp4q_dequeue(tp4q, &desc, 1);
+	if (ndescs == 0) {
+		/* Do not call this function if you have no entries left
+		 * in the queue to use for errors.
+		 */
+		WARN_ON_ONCE(1);
+		return;
+	}
+
+	tp4q_set_error(&desc, errno);
+	err = tp4q_enqueue(tp4q, &desc, 1);
+	WARN_ON(err);
+}
+
+/**
+ *
+ **/
+static inline void tp4q_disable(struct device *dev,
+				struct tp4_queue *tp4q)
+{
+	int i;
+
+	/* Already been cleared, so nothing to do */
+	if (!tp4q->umem)
+		return;
+
+	if (tp4q->dma_info) {
+		/* Unmap DMA */
+		for (i = 0; i < tp4q->umem->npgs; i++)
+			dma_unmap_page(dev, tp4q->dma_info[i].dma, PAGE_SIZE,
+				       tp4q->direction);
+
+		kfree(tp4q->dma_info);
+		tp4q->dma_info = NULL;
+	}
+
+	tp4q->umem = NULL;
+}
+
+/**
+ *
+ **/
+static inline int tp4q_enable(struct device *dev,
+			      struct tp4_queue *tp4q,
+			      enum dma_data_direction direction)
+{
+	int i, j;
+
+	/* Empty umem signifies application wants only one of RX or TX */
+	if (!tp4q->umem)
+		return 0;
+
+	/* DMA map all the buffers in bufs up front, and sync prior
+	 * kicking userspace. Is this sane? Strictly user land owns
+	 * the buffer until they show up on the avail queue. However,
+	 * mapping should be ok.
+	 */
+	if (direction != DMA_NONE) {
+		tp4q->dma_info = kzalloc(sizeof(*tp4q->dma_info) *
+					 tp4q->umem->npgs, GFP_KERNEL);
+		if (!tp4q->dma_info)
+			return -ENOMEM;
+
+		for (i = 0; i < tp4q->umem->npgs; i++) {
+			dma_addr_t dma;
+
+			dma = dma_map_page(dev, tp4q->umem->pgs[i], 0,
+					   PAGE_SIZE, direction);
+			if (dma_mapping_error(dev, dma)) {
+				for (j = 0; j < i; j++)
+					dma_unmap_page(dev,
+						       tp4q->dma_info[j].dma,
+						       PAGE_SIZE, direction);
+				kfree(tp4q->dma_info);
+				tp4q->dma_info = NULL;
+				return -EBUSY;
+			}
+
+			tp4q->dma_info[i].page = tp4q->umem->pgs[i];
+			tp4q->dma_info[i].dma = dma;
+		}
+	} else {
+		tp4q->dma_info = NULL;
+	}
+
+	tp4q->direction = direction;
+	return 0;
+}
+
+/**
+ *
+ **/
+static inline unsigned int tp4q_get_frame_size(struct tp4_queue *tp4q)
+{
+	return tp4q->umem->frame_size;
 }
 
 /**

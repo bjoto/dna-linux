@@ -57,6 +57,7 @@ struct sockaddr_ll {
 #define PACKET_ROLLOVER_STATS		21
 #define PACKET_FANOUT_DATA		22
 #define PACKET_MEMREG			23
+#define PACKET_ZEROCOPY			24
 
 #define PACKET_FANOUT_HASH		0
 #define PACKET_FANOUT_LB		1

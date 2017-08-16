@@ -3182,14 +3182,100 @@ out:
 	return err;
 }
 
+static void packet_v4_read_callback(void *readable_opaque)
+{
+	struct sock *sk = (struct sock *)readable_opaque;
+
+	sk->sk_data_ready(sk);
+}
+
+static void packet_v4_write_callback(void *writable_opaque)
+{
+	struct sock *sk = (struct sock *)writable_opaque;
+
+	sk->sk_write_space(sk);
+}
+
+static int packet_v4_zerocopy(struct sock *sk)
+{
+	struct packet_sock *po = pkt_sk(sk);
+	struct socket *sock = sk->sk_socket;
+	struct tp4_netdev_parms params;
+	int ret;
+
+	/* Currently, only RAW sockets are supported.*/
+	if (sock->type != SOCK_RAW)
+		return -EINVAL;
+
+	/* Socket needs to be bound to an interface. */
+	if (!po->prot_hook.dev)
+		return -EISCONN;
+
+	/* The device needs to have both the NDOs implemented. */
+	if (!(po->prot_hook.dev->netdev_ops->ndo_tp4_zerocopy &&
+	      po->prot_hook.dev->netdev_ops->ndo_tp4_xmit))
+		return -EOPNOTSUPP;
+
+	if (po->packet_zerocopy)
+		return -EBUSY;
+
+	if (!(po->rx_ring.pg_vec && po->tx_ring.pg_vec))
+		return -EOPNOTSUPP;
+
+	spin_lock(&po->bind_lock);
+	unregister_prot_hook(sk, true);
+	spin_unlock(&po->bind_lock);
+
+	params.command = TP4_ENABLE;
+	if (po->rx_ring.tp4q.umem)
+		params.tp4q_rx = &po->rx_ring.tp4q;
+	else
+		params.tp4q_rx = NULL;
+	if (po->tx_ring.tp4q.umem)
+		params.tp4q_tx = &po->tx_ring.tp4q;
+	else
+		params.tp4q_tx = NULL;
+	params.readable = packet_v4_read_callback;
+	params.writable = packet_v4_write_callback;
+	params.readable_opaque = (void *)sk;
+	params.writable_opaque = (void *)sk;
+
+	rtnl_lock();
+	ret = po->prot_hook.dev->netdev_ops->ndo_tp4_zerocopy(
+		po->prot_hook.dev, &params);
+	rtnl_unlock();
+	if (ret == 0)
+		po->packet_zerocopy = true;
+
+	return ret;
+}
+
 static int packet_sendmsg(struct socket *sock, struct msghdr *msg, size_t len)
 {
 	struct sock *sk = sock->sk;
 	struct packet_sock *po = pkt_sk(sk);
+	int ret;
 
 	if (po->tx_ring.pg_vec) {
 		if (po->tp_version != TPACKET_V4)
 			return tpacket_snd(po, msg);
+
+		if (po->packet_zerocopy) {
+			/* NOTE: It's a bit unorthodox having an ndo
+			 * without the RTNL lock taken during the
+			 * call. Further; We're taking the bind_lock
+			 * for prot_hook's sake. Corollary: The
+			 * ndo_tp4_xmit cannot sleep.
+			 * TODO: We need to be able to sleep... What
+			 *  about e.g.	bool need_wait =
+			 *  !(msg->msg_flags & MSG_DONTWAIT);
+			 */
+			spin_lock(&po->bind_lock);
+			ret = po->prot_hook.dev->netdev_ops->ndo_tp4_xmit(
+				po->prot_hook.dev);
+			spin_unlock(&po->bind_lock);
+			return ret;
+		}
 
 		return packet_v4_snd(po, msg);
 	}
@@ -3343,6 +3429,29 @@ static void packet_clear_ring(struct sock *sk, int tx_ring)
 	packet_set_ring(sk, &req_u, 1, tx_ring);
 }
 
+static void packet_disable_zerocopy(struct sock *sk)
+{
+	struct net_device *dev;
+	struct packet_sock *po;
+
+	po = pkt_sk(sk);
+	if (po->packet_zerocopy) {
+		dev = packet_cached_dev_get(po);
+		if (dev) {
+			struct tp4_netdev_parms params = {
+				.command = TP4_DISABLE };
+
+			rtnl_lock();
+			mutex_lock(&po->pg_vec_lock);
+			dev->netdev_ops->ndo_tp4_zerocopy(dev, &params);
+			mutex_unlock(&po->pg_vec_lock);
+			rtnl_unlock();
+
+			dev_put(dev);
+		}
+	}
+}
+
 /*
  *	Close a PACKET socket. This is fairly simple. We immediately go
  *	to 'closed' state and remove our protocol entry in the device list.
@@ -3368,6 +3477,8 @@ static int packet_release(struct socket *sock)
 	preempt_disable();
 	sock_prot_inuse_add(net, sk->sk_prot, -1);
 	preempt_enable();
+
+	packet_disable_zerocopy(sk);
 
 	spin_lock(&po->bind_lock);
 	unregister_prot_hook(sk, false);
@@ -3458,6 +3569,8 @@ static int packet_do_bind(struct sock *sk, const char *name, int ifindex,
 	need_rehook = proto_curr != proto || dev_curr != dev;
 
 	if (need_rehook) {
+		if (sk && !dev_curr && (po->tp_version == TPACKET_V4))
+			packet_disable_zerocopy(sk);
 		if (po->running) {
 			rcu_read_unlock();
 			__unregister_prot_hook(sk, true);
@@ -3495,7 +3608,9 @@ static int packet_do_bind(struct sock *sk, const char *name, int ifindex,
 		if (!sock_flag(sk, SOCK_DEAD))
 			sk->sk_error_report(sk);
 	}
-
+	if (need_rehook && (po->tp_version == TPACKET_V4) &&
+	    (po->packet_zerocopy))
+		packet_v4_zerocopy(sk);
 out_unlock:
 	rcu_read_unlock();
 	spin_unlock(&po->bind_lock);
@@ -4033,6 +4148,12 @@ packet_setsockopt(struct socket *sock, int level, int optname, char __user *optv
 			return packet_set_ring(sk, &req_u, 0,
 					       optname == PACKET_TX_RING);
 
+	}
+	case PACKET_ZEROCOPY:
+	{
+		if (po->tp_version == TPACKET_V4)
+			return packet_v4_zerocopy(sk);
+		return -EOPNOTSUPP;
 	}
 	case PACKET_COPY_THRESH:
 	{
