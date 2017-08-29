@@ -3027,6 +3027,13 @@ static int i40e_configure_tx_ring(struct i40e_ring *ring)
 	/* cache tail off for easier writes later */
 	ring->tail = hw->hw_addr + I40E_QTX_TAIL(pf_q);
 
+	if (i40e_tp4_zerocopy_enabled(vsi) && !ring_is_xdp(ring)) {
+		ring->tp4q = vsi->tp4q_tx;
+		err = i40e_enable_tp4_queue(ring, DMA_TO_DEVICE);
+		if (err)
+			return err;
+	}
+
 	return 0;
 }
 
@@ -9858,6 +9865,7 @@ static const struct net_device_ops i40e_netdev_ops = {
 	.ndo_bridge_setlink	= i40e_ndo_bridge_setlink,
 	.ndo_xdp		= i40e_xdp,
 	.ndo_tp4_zerocopy	= i40e_tp4_zerocopy,
+	.ndo_tp4_xmit           = i40e_tp4_xmit,
 };
 
 /**

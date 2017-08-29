@@ -640,6 +640,10 @@ static void i40e_unmap_and_free_tx_resource(struct i40e_ring *ring,
 						 dma_unmap_addr(tx_buffer, dma),
 						 dma_unmap_len(tx_buffer, len),
 						 DMA_TO_DEVICE);
+		} else if (tx_buffer->bytecount) {
+			err = tp4a_flush_frame(ring->tp4a_cpl,
+					       tx_buffer->tp4_addr, 0, 0, true);
+			WARN_ON_ONCE(err); /* unbalanced deq/enq! */
 		}
 	} else if (tx_buffer->skb) {
 		if (tx_buffer->tx_flags & I40E_TX_FLAGS_FD_SB)
@@ -661,6 +665,7 @@ static void i40e_unmap_and_free_tx_resource(struct i40e_ring *ring,
 	}
 
 	tx_buffer->next_to_watch = NULL;
+	tx_buffer->bytecount = 0;
 	tx_buffer->skb = NULL;
 	tx_buffer->tp4a_cpl_xdp = NULL;
 	dma_unmap_len_set(tx_buffer, len, 0);
@@ -683,6 +688,14 @@ void i40e_clean_tx_ring(struct i40e_ring *tx_ring)
 	/* Free all the Tx ring sk_buffs */
 	for (i = 0; i < tx_ring->count; i++)
 		i40e_unmap_and_free_tx_resource(tx_ring, &tx_ring->tx_bi[i]);
+
+	if (i40e_tp4_zerocopy_enabled(tx_ring->vsi) && tx_ring->tp4q &&
+	    !ring_is_xdp(tx_ring)) {
+		tp4q_disable(tx_ring->dev, tx_ring->tp4q);
+		tp4a_packet_array_free(tx_ring->tp4a_cpl);
+		tp4a_packet_array_free(tx_ring->tp4a_req);
+		tx_ring->tp4q = NULL;
+	}
 
 	bi_size = sizeof(struct i40e_tx_buffer) * tx_ring->count;
 	memset(tx_ring->tx_bi, 0, bi_size);
@@ -740,6 +753,10 @@ u32 i40e_get_tx_pending(struct i40e_ring *ring)
 	return 0;
 }
 
+static bool i40e_tp4_clean_tx_irq(struct i40e_vsi *vsi,
+				  struct i40e_ring *tx_ring,
+				  unsigned int budget);
+
 #define WB_STRIDE 4
 
 /**
@@ -760,6 +777,9 @@ static bool i40e_clean_tx_irq(struct i40e_vsi *vsi,
 	unsigned int total_bytes = 0, total_packets = 0;
 	unsigned int budget = vsi->work_limit;
 	int err;
+
+	if (!ring_is_xdp(tx_ring) && i40e_tp4_zerocopy_enabled(vsi))
+		return i40e_tp4_clean_tx_irq(vsi, tx_ring, budget);
 
 	tx_buf = &tx_ring->tx_bi[i];
 	tx_desc = I40E_TX_DESC(tx_ring, i);
@@ -2467,6 +2487,8 @@ enable_int:
 		q_vector->itr_countdown = ITR_COUNTDOWN_START;
 }
 
+static bool i40e_tp4_xmit_irq(struct i40e_ring *tx_ring);
+
 /**
  * i40e_napi_poll - NAPI polling Rx/Tx cleanup routine
  * @napi: napi struct with our devices info in it
@@ -2490,6 +2512,11 @@ int i40e_napi_poll(struct napi_struct *napi, int budget)
 	if (test_bit(__I40E_VSI_DOWN, vsi->state)) {
 		napi_complete(napi);
 		return 0;
+	}
+
+	if (i40e_tp4_zerocopy_enabled(vsi)) {
+		if (i40e_tp4_xmit_irq(vsi->tx_rings[0]))
+			clean_complete = false;
 	}
 
 	/* Since the actual Tx work is minimal, we can give the Tx a larger
@@ -3616,4 +3643,274 @@ netdev_tx_t i40e_lan_xmit_frame(struct sk_buff *skb, struct net_device *netdev)
 		return NETDEV_TX_OK;
 
 	return i40e_xmit_frame_ring(skb, tx_ring);
+}
+
+/**
+ * i40e_tp4_xmit_irq - transmit tp4 ring in napi context
+ * @tx_ring: Tx ring
+ *
+ * Returns true if there is more work to be done
+ **/
+bool i40e_tp4_xmit_irq(struct i40e_ring *tx_ring)
+{
+	unsigned int budget = tx_ring->vsi->work_limit;
+	unsigned int total_packets = 0;
+	struct i40e_tx_desc *tx_desc;
+	u16 ntu, unused;
+	bool more_work = false;
+	int err;
+
+	tp4a_discard(tx_ring->tp4a_req);
+	tp4a_populate(tx_ring->tp4a_req);
+
+	for (;;) {
+		struct i40e_tx_buffer *first;
+		struct tpacket4_hdr *hdr;
+		struct tp4_packet pkt;
+		u64 addr;
+
+		err = tp4a_next_packet(tx_ring->tp4a_req, &pkt);
+		if (err)
+			break;
+
+		unused = I40E_DESC_UNUSED(tx_ring);
+		if (!unused) {
+			more_work = true;
+			tp4a_reset(tx_ring->tp4a_req);
+			if (unlikely(!total_packets)) {
+				tx_ring->tx_stats.tx_busy++;
+				return true;
+			}
+			break;
+		}
+
+		/* enough hw descs to send the packet? */
+		if (unused < tp4p_num_frames(&pkt)) {
+			more_work = true;
+			tp4a_reset(tx_ring->tp4a_req);
+			break;
+		}
+
+		/* validate packet back to front */
+		tp4p_last(&pkt);
+		do {
+			addr = tp4p_get_frame_id(&pkt);
+			hdr = tp4q_get_validated_header(tx_ring->tp4q, addr);
+			if (!hdr) {
+				tp4p_set_error(&pkt, EBADF);
+				tp4a_flush(tx_ring->tp4a_req);
+				break;
+			}
+		} while (tp4p_prev_frame(&pkt) == 0);
+
+		if (!hdr)
+			continue;
+
+		ntu = tx_ring->next_to_use;
+		first = &tx_ring->tx_bi[ntu];
+
+		for (;;) {
+			struct i40e_tx_buffer *tx_buf;
+			u32 size, td_cmd;
+			dma_addr_t dma;
+
+			td_cmd = I40E_TX_DESC_CMD_ICRC | I40E_TX_DESC_CMD_RS;
+			size = hdr->data_end - hdr->data;
+			err = tp4q_get_header_dma(tx_ring->tp4q, addr, &dma);
+			WARN_ON_ONCE(err);
+			dma_sync_single_range_for_device(tx_ring->dev,
+							 dma, hdr->data,
+							 size, DMA_TO_DEVICE);
+
+			tx_buf = &tx_ring->tx_bi[ntu];
+			tx_buf->bytecount = size;
+			tx_buf->gso_segs = 1;
+			tx_buf->tp4_addr = addr;
+
+			tx_desc = I40E_TX_DESC(tx_ring, ntu);
+			tx_desc->buffer_addr = cpu_to_le64(dma + hdr->data);
+			if (tp4p_is_last_frame(&pkt))
+				td_cmd |= I40E_TX_DESC_CMD_EOP;
+			tx_desc->cmd_type_offset_bsz = build_ctob(td_cmd, 0,
+								  size, 0);
+
+			/* Make certain all of the status bits have been updated
+			 * before next_to_watch is written.
+			 */
+			smp_wmb();
+
+			if (tp4p_is_last_frame(&pkt))
+				first->next_to_watch = tx_desc;
+			ntu++;
+			if (ntu == tx_ring->count)
+				ntu = 0;
+
+			if (tp4p_next_frame(&pkt))
+				break;
+
+			/* This path is only for multi-frame
+			 * packets. Still, it's unfortunate that we
+			 * need to call get_header_again. Maybe we
+			 * should cache hdr in the packet_array
+			 * somehow.
+			 */
+			addr = tp4p_get_frame_id(&pkt);
+			hdr = tp4q_get_header(tx_ring->tp4q, addr);
+		}
+
+		tp4a_discard(tx_ring->tp4a_req);
+		total_packets++;
+		tx_ring->next_to_use = ntu;
+		if (--budget == 0) {
+			more_work = true;
+			break;
+		}
+	}
+
+	/* Force memory writes to complete before letting h/w
+	 * know there are new descriptors to fetch.
+	 */
+	wmb();
+	writel(tx_ring->next_to_use, tx_ring->tail);
+
+	return more_work;
+}
+
+/**
+ * i40e_tp4_xmit - kicks the Tx ring
+ * @netdev: netdevice
+ *
+ * Returns less than zero on failure
+ **/
+int i40e_tp4_xmit(struct net_device *netdev)
+{
+	struct i40e_netdev_priv *np = netdev_priv(netdev);
+	struct i40e_vsi *vsi = np->vsi;
+
+	napi_schedule(&vsi->tx_rings[0]->q_vector->napi);
+	return 0;
+}
+
+/**
+ * i40e_tp4_clean_tx_buffer - completes a sent frame
+ * @tx_ring: Tx ring
+ * @tx_buf: buffer info to clean
+ * @is_eop: true if end-of-packet
+ **/
+static inline void i40e_tp4_clean_tx_buffer(struct i40e_ring *tx_ring,
+					    struct i40e_tx_buffer *tx_buf,
+					    bool is_eop)
+{
+	int err;
+
+	err = tp4a_add_frame(tx_ring->tp4a_cpl, tx_buf->tp4_addr,
+			     tx_buf->bytecount, 0, is_eop);
+	WARN_ON_ONCE(err);
+
+	tx_buf->bytecount = 0;
+}
+
+/**
+ * i40e_tp4_clean_tx_irq - cleans the Tx ring
+ * @vsi: the vsi
+ * @tx_ring: the Tx ring
+ * @budget: the budget
+ *
+ * Returns true if more work is needed
+ **/
+static bool i40e_tp4_clean_tx_irq(struct i40e_vsi *vsi,
+				  struct i40e_ring *tx_ring,
+				  unsigned int budget)
+{
+	unsigned int total_bytes = 0, total_packets = 0;
+	u16 i = tx_ring->next_to_clean;
+	struct i40e_tx_buffer *tx_buf;
+	struct i40e_tx_desc *tx_head;
+	struct i40e_tx_desc *tx_desc;
+	int err;
+
+	tx_buf = &tx_ring->tx_bi[i];
+	tx_desc = I40E_TX_DESC(tx_ring, i);
+	i -= tx_ring->count;
+
+	tx_head = I40E_TX_DESC(tx_ring, i40e_get_head(tx_ring));
+
+	do {
+		struct i40e_tx_desc *eop_desc = tx_buf->next_to_watch;
+
+		/* if next_to_watch is not set then there is no work pending */
+		if (!eop_desc)
+			break;
+
+		/* prevent any other reads prior to eop_desc */
+		read_barrier_depends();
+
+		/* we have caught up to head, no work left to do */
+		if (tx_head == tx_desc)
+			break;
+
+		/* clear next_to_watch to prevent false hangs */
+		tx_buf->next_to_watch = NULL;
+
+		/* update the statistics for this packet */
+		total_bytes += tx_buf->bytecount;
+		total_packets += tx_buf->gso_segs;
+
+		i40e_tp4_clean_tx_buffer(tx_ring, tx_buf, tx_desc == eop_desc);
+
+		while (tx_desc != eop_desc) {
+			tx_buf++;
+			tx_desc++;
+			i++;
+			if (unlikely(!i)) {
+				i -= tx_ring->count;
+				tx_buf = tx_ring->tx_bi;
+				tx_desc = I40E_TX_DESC(tx_ring, 0);
+			}
+			i40e_tp4_clean_tx_buffer(tx_ring, tx_buf,
+						 tx_desc == eop_desc);
+		}
+
+		/* move us one more past the eop_desc for start of next pkt */
+		tx_buf++;
+		tx_desc++;
+		i++;
+		if (unlikely(!i)) {
+			i -= tx_ring->count;
+			tx_buf = tx_ring->tx_bi;
+			tx_desc = I40E_TX_DESC(tx_ring, 0);
+		}
+
+		/* update budget accounting */
+		budget--;
+	} while (likely(budget));
+
+	i += tx_ring->count;
+	tx_ring->next_to_clean = i;
+	u64_stats_update_begin(&tx_ring->syncp);
+	tx_ring->stats.bytes += total_bytes;
+	tx_ring->stats.packets += total_packets;
+	u64_stats_update_end(&tx_ring->syncp);
+	tx_ring->q_vector->tx.total_bytes += total_bytes;
+	tx_ring->q_vector->tx.total_packets += total_packets;
+
+	if (tx_ring->flags & I40E_TXR_FLAGS_WB_ON_ITR) {
+		/* check to see if there are < 4 descriptors
+		 * waiting to be written back, then kick the hardware to force
+		 * them to be written back in case we stay in NAPI.
+		 * In this mode on X722 we do not enable interrupts.
+		 */
+		unsigned int j = i40e_get_tx_pending(tx_ring);
+
+		if (budget &&
+		    ((j / WB_STRIDE) == 0) && (j > 0) &&
+		    !test_bit(__I40E_VSI_DOWN, vsi->state) &&
+		    (I40E_DESC_UNUSED(tx_ring) != tx_ring->count))
+			tx_ring->arm_wb = true;
+	}
+
+	tp4a_end(tx_ring->tp4a_cpl);
+	err = tp4a_flush(tx_ring->tp4a_cpl);
+	WARN_ON_ONCE(err);
+	return !!budget;
 }

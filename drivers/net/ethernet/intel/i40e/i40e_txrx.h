@@ -501,6 +501,7 @@ void i40e_force_wb(struct i40e_vsi *vsi, struct i40e_q_vector *q_vector);
 u32 i40e_get_tx_pending(struct i40e_ring *ring);
 int __i40e_maybe_stop_tx(struct i40e_ring *tx_ring, int size);
 bool __i40e_chk_linearize(struct sk_buff *skb);
+int i40e_tp4_xmit(struct net_device *netdev);
 void __i40e_tp4_disable(struct i40e_ring *ring, bool tx_queue);
 
 /**
