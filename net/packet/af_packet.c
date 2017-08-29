@@ -424,6 +424,8 @@ static void __packet_set_status(struct packet_sock *po, void *frame, int status)
 		h.h3->tp_status = status;
 		flush_dcache_page(pgv_to_page(&h.h3->tp_status));
 		break;
+	case TPACKET_V4:
+		return;
 	default:
 		WARN(1, "TPACKET version not supported.\n");
 		BUG();
@@ -449,6 +451,8 @@ static int __packet_get_status(struct packet_sock *po, void *frame)
 	case TPACKET_V3:
 		flush_dcache_page(pgv_to_page(&h.h3->tp_status));
 		return h.h3->tp_status;
+	case TPACKET_V4:
+		return 0;
 	default:
 		WARN(1, "TPACKET version not supported.\n");
 		BUG();
@@ -2481,6 +2485,24 @@ drop_n_account:
 	goto drop_n_restore;
 }
 
+static void packet_v4_destruct_skb(struct sk_buff *skb)
+{
+	struct packet_sock *po = pkt_sk(skb->sk);
+
+	if (likely(po->tx_ring.pg_vec)) {
+		u64 desc_addr = (u64)skb_shinfo(skb)->destructor_arg;
+		struct tpacket4_desc v4desc = { .addr = desc_addr };
+
+		spin_lock(&po->tx_ring.tp4q.tx_lock);
+		(void)tp4q_enqueue(&po->tx_ring.tp4q, &v4desc, 1);
+		spin_unlock(&po->tx_ring.tp4q.tx_lock);
+
+		packet_dec_pending(&po->tx_ring);
+	}
+
+	sock_wfree(skb);
+}
+
 static void tpacket_destruct_skb(struct sk_buff *skb)
 {
 	struct packet_sock *po = pkt_sk(skb->sk);
@@ -2538,24 +2560,24 @@ static int packet_snd_vnet_parse(struct msghdr *msg, size_t *len,
 }
 
 static int tpacket_fill_skb(struct packet_sock *po, struct sk_buff *skb,
-		void *frame, struct net_device *dev, void *data, int tp_len,
+		void *dtor_arg, struct net_device *dev, void *data, int tp_len,
 		__be16 proto, unsigned char *addr, int hlen, int copylen,
 		const struct sockcm_cookie *sockc)
 {
-	union tpacket_uhdr ph;
 	int to_write, offset, len, nr_frags, len_max;
 	struct socket *sock = po->sk.sk_socket;
 	struct page *page;
 	int err;
 
-	ph.raw = frame;
-
 	skb->protocol = proto;
 	skb->dev = dev;
 	skb->priority = po->sk.sk_priority;
 	skb->mark = po->sk.sk_mark;
-	sock_tx_timestamp(&po->sk, sockc->tsflags, &skb_shinfo(skb)->tx_flags);
-	skb_shinfo(skb)->destructor_arg = ph.raw;
+	if (sockc) {
+		sock_tx_timestamp(&po->sk, sockc->tsflags,
+				  &skb_shinfo(skb)->tx_flags);
+	}
+	skb_shinfo(skb)->destructor_arg = dtor_arg;
 
 	skb_reserve(skb, hlen);
 	skb_reset_network_header(skb);
@@ -2627,6 +2649,14 @@ static int tpacket_parse_header(struct packet_sock *po, void *frame,
 	ph.raw = frame;
 
 	switch (po->tp_version) {
+	case TPACKET_V4:
+		if (unlikely(!tp4q_validate_header(&po->tx_ring.tp4q,
+						   frame))) {
+			pr_warn_once("packet v4 header is corrupted!\n");
+			return -EBADF;
+		}
+		tp_len = ph.h4->data_end - ph.h4->data;
+		break;
 	case TPACKET_V3:
 		if (ph.h3->tp_next_offset != 0) {
 			pr_warn_once("variable sized slot not supported");
@@ -2653,6 +2683,10 @@ static int tpacket_parse_header(struct packet_sock *po, void *frame,
 		off_max = po->tx_ring.frame_size - tp_len;
 		if (po->sk.sk_type == SOCK_DGRAM) {
 			switch (po->tp_version) {
+			case TPACKET_V4:
+				WARN(1, "TPACKET4 SOCK_DGRAM not supported.\n");
+				off = 0;
+				break;
 			case TPACKET_V3:
 				off = ph.h3->tp_net;
 				break;
@@ -2665,6 +2699,10 @@ static int tpacket_parse_header(struct packet_sock *po, void *frame,
 			}
 		} else {
 			switch (po->tp_version) {
+			case TPACKET_V4:
+				WARN(1, "TPACKET4 SOCK_DGRAM not supported.\n");
+				off = 0;
+				break;
 			case TPACKET_V3:
 				off = ph.h3->tp_mac;
 				break;
@@ -2679,7 +2717,14 @@ static int tpacket_parse_header(struct packet_sock *po, void *frame,
 		if (unlikely((off < off_min) || (off_max < off)))
 			return -EINVAL;
 	} else {
-		off = po->tp_hdrlen - sizeof(struct sockaddr_ll);
+		switch (po->tp_version) {
+		case TPACKET_V4:
+			off = ph.h4->data;
+			break;
+		default:
+			off = po->tp_hdrlen - sizeof(struct sockaddr_ll);
+			break;
+		}
 	}
 
 	*data = frame + off;
@@ -2859,6 +2904,117 @@ out:
 	return err;
 }
 
+static int packet_v4_snd(struct packet_sock *po, struct msghdr *msg)
+{
+	DECLARE_SOCKADDR(struct sockaddr_ll *, saddr, msg->msg_name);
+	bool need_wait = !(msg->msg_flags & MSG_DONTWAIT);
+	struct packet_ring_buffer *rb = &po->tx_ring;
+	int err, dlen, size_max, hlen, tlen;
+	struct tpacket4_desc v4desc = {};
+	struct tpacket4_hdr *hdr;
+	struct net_device *dev;
+	struct sk_buff *skb;
+	unsigned char *addr;
+	__be16 proto;
+	void *data;
+
+	mutex_lock(&po->pg_vec_lock);
+
+	if (likely(!saddr)) {
+		dev = packet_cached_dev_get(po);
+		proto = po->num;
+		addr = NULL;
+	} else {
+		pr_warn("packet v4 not implemented!\n");
+		return -EINVAL;
+	}
+
+	err = -ENXIO;
+	if (unlikely(!dev))
+		goto out;
+	err = -ENETDOWN;
+	if (unlikely(!(dev->flags & IFF_UP)))
+		goto out_put;
+
+	size_max = tp4q_max_data_size(&rb->tp4q);
+
+	if (size_max > dev->mtu + dev->hard_header_len + VLAN_HLEN)
+		size_max = dev->mtu + dev->hard_header_len + VLAN_HLEN;
+
+	do {
+		if (likely(tp4q_dequeue(&rb->tp4q, &v4desc, 1))) {
+			hdr = tp4q_get_validated_header(&rb->tp4q, v4desc.addr);
+			if (!hdr) {
+				skb = NULL;
+				err = -EBADF;
+				goto out_err;
+			}
+		} else {
+			hdr = NULL;
+			if (need_wait && need_resched())
+				schedule();
+			continue;
+		}
+
+		dlen = hdr->data_end - hdr->data;
+		data = tp4q_get_data(&rb->tp4q, hdr);
+		hlen = LL_RESERVED_SPACE(dev);
+		tlen = dev->needed_tailroom;
+		skb = sock_alloc_send_skb(&po->sk,
+					  hlen + tlen +
+					  sizeof(struct sockaddr_ll),
+					  !need_wait, &err);
+
+		if (unlikely(!skb)) {
+			err = -EAGAIN;
+			goto out_err;
+		}
+
+		dlen = tpacket_fill_skb(po, skb, (void *)(long)v4desc.addr, dev,
+					data, dlen, proto, addr, hlen,
+					dev->hard_header_len, NULL);
+		if (likely(dlen >= 0) &&
+		    dlen > dev->mtu + dev->hard_header_len &&
+		    !packet_extra_vlan_len_allowed(dev, skb)) {
+			dlen = -EMSGSIZE;
+		}
+
+		if (unlikely(dlen < 0)) {
+			err = dlen;
+			goto out_err;
+		}
+
+		skb->destructor = packet_v4_destruct_skb;
+		packet_inc_pending(&po->tx_ring);
+
+		err = po->xmit(skb);
+		/* Ignore NET_XMIT_CN as packet might have been sent */
+		if (err == NET_XMIT_DROP || err == NETDEV_TX_BUSY) {
+			err = -EAGAIN;
+			goto out_err;
+		}
+	} while (likely(hdr) ||
+		/* Note: packet_read_pending() might be slow if we have
+		 * to call it as it's per_cpu variable, but in fast-path
+		 * we already short-circuit the loop with the first
+		 * condition, and luckily don't have to go that path
+		 * anyway.
+		 */
+		 (need_wait && packet_read_pending(&po->tx_ring)));
+
+	goto out_put;
+
+out_err:
+	tp4q_set_error(&v4desc, -err);
+	(void)tp4q_enqueue(&rb->tp4q, &v4desc, 1);
+	kfree_skb(skb);
+out_put:
+	dev_put(dev);
+out:
+	mutex_unlock(&po->pg_vec_lock);
+	return 0;
+}
+
 static struct sk_buff *packet_alloc_skb(struct sock *sk, size_t prepad,
 				        size_t reserve, size_t len,
 				        size_t linear, int noblock,
@@ -3031,10 +3187,14 @@ static int packet_sendmsg(struct socket *sock, struct msghdr *msg, size_t len)
 	struct sock *sk = sock->sk;
 	struct packet_sock *po = pkt_sk(sk);
 
-	if (po->tx_ring.pg_vec)
-		return tpacket_snd(po, msg);
-	else
-		return packet_snd(sock, msg, len);
+	if (po->tx_ring.pg_vec) {
+		if (po->tp_version != TPACKET_V4)
+			return tpacket_snd(po, msg);
+
+		return packet_v4_snd(po, msg);
+	}
+
+	return packet_snd(sock, msg, len);
 }
 
 static void

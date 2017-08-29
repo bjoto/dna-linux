@@ -231,6 +231,25 @@ static inline int tp4q_enqueue(struct tp4_queue *q,
 /**
  *
  **/
+static inline bool tp4q_validate_header(struct tp4_queue *tp4q,
+					struct tpacket4_hdr *hdr)
+{
+	unsigned int max_off = tp4q->umem->frame_size -
+			       tp4q->umem->header_headroom;
+	unsigned int min_off = TPACKET4_HDRLEN;
+
+	if (hdr->data >= max_off || hdr->data < min_off ||
+	    hdr->data_end > max_off || hdr->data_end < min_off ||
+	    hdr->data_end < hdr->data) {
+		return false;
+	}
+
+	return true;
+}
+
+/**
+ *
+ **/
 static inline bool tp4_get_page_offset(struct tp4_queue *tp4q, u64 addr,
 				       u64 *pg, u64 *off)
 {
@@ -264,11 +283,35 @@ static inline struct tpacket4_hdr *tp4q_get_header(struct tp4_queue *tp4q,
 /**
  *
  **/
+static inline struct tpacket4_hdr *tp4q_get_validated_header(
+	struct tp4_queue *tp4q, u64 addr)
+{
+	struct tpacket4_hdr *hdr;
+
+	hdr = tp4q_get_header(tp4q, addr);
+	if (!hdr || !tp4q_validate_header(tp4q, hdr))
+		return NULL;
+
+	return hdr;
+}
+
+/**
+ *
+ **/
 static inline void tp4q_write_header(struct tp4_queue *tp4q,
 				     struct tpacket4_hdr *hdr, u32 size)
 {
 	hdr->data = TPACKET4_HDRLEN + tp4q->umem->data_headroom;
 	hdr->data_end = hdr->data + size;
+}
+
+/**
+ *
+ **/
+static inline void tp4q_set_error(struct tpacket4_desc *desc,
+				  int errno)
+{
+	desc->error = errno;
 }
 
 /**
