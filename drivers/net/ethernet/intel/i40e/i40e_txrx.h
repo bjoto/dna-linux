@@ -298,6 +298,7 @@ struct i40e_tx_buffer {
 	union {
 		struct sk_buff *skb;
 		void *raw_buf;
+		u64 tp4_addr;
 	};
 	unsigned int bytecount;
 	unsigned short gso_segs;
@@ -305,6 +306,7 @@ struct i40e_tx_buffer {
 	DEFINE_DMA_UNMAP_ADDR(dma);
 	DEFINE_DMA_UNMAP_LEN(len);
 	u32 tx_flags;
+	struct tp4_packet_array *tp4a_cpl_xdp;
 };
 
 struct i40e_rx_buffer {
@@ -316,6 +318,7 @@ struct i40e_rx_buffer {
 	__u16 page_offset;
 #endif
 	__u16 pagecnt_bias;
+	u64 tp4_addr;
 };
 
 struct i40e_queue_stats {
@@ -423,6 +426,9 @@ struct i40e_ring {
 					 * i40e_clean_rx_ring_irq() is called
 					 * for this ring.
 					 */
+	struct tp4_queue *tp4q;
+	struct tp4_packet_array *tp4a_req; /* packets from userland */
+	struct tp4_packet_array *tp4a_cpl; /* complete to userland */
 } ____cacheline_internodealigned_in_smp;
 
 static inline bool ring_uses_build_skb(struct i40e_ring *ring)
@@ -495,6 +501,7 @@ void i40e_force_wb(struct i40e_vsi *vsi, struct i40e_q_vector *q_vector);
 u32 i40e_get_tx_pending(struct i40e_ring *ring);
 int __i40e_maybe_stop_tx(struct i40e_ring *tx_ring, int size);
 bool __i40e_chk_linearize(struct sk_buff *skb);
+void __i40e_tp4_disable(struct i40e_ring *ring, bool tx_queue);
 
 /**
  * i40e_get_head - Retrieve head from head writeback

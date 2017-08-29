@@ -616,6 +616,7 @@ struct i40e_vsi {
 	DECLARE_BITMAP(state, __I40E_VSI_STATE_SIZE__);
 #define I40E_VSI_FLAG_FILTER_CHANGED	BIT(0)
 #define I40E_VSI_FLAG_VEB_OWNER		BIT(1)
+#define I40E_VSI_FLAG_TP4_ZEROCOPY	BIT(2)
 	u64 flags;
 
 	/* Per VSI lock to protect elements/hash (MAC filter) */
@@ -672,6 +673,7 @@ struct i40e_vsi {
 	u16 alloc_queue_pairs;	/* Allocated Tx/Rx queues */
 	u16 req_queue_pairs;	/* User requested queue pairs */
 	u16 num_queue_pairs;	/* Used tx and rx pairs */
+	u16 prev_queue_pairs;
 	u16 num_desc;
 	enum i40e_vsi_type type;  /* VSI type, e.g., LAN, FCoE, etc */
 	s16 vf_id;		/* Virtual function ID for SRIOV VSIs */
@@ -696,6 +698,10 @@ struct i40e_vsi {
 	struct kobject *kobj;	/* sysfs object */
 	bool current_isup;	/* Sync 'link up' logging */
 	enum i40e_aq_link_speed current_speed;	/* Sync link speed logging */
+
+	/* PACKET_ZEROCOPY references */
+	struct tp4_queue *tp4q_rx;
+	struct tp4_queue *tp4q_tx;
 
 	void *priv;	/* client driver data reference. */
 
@@ -843,6 +849,16 @@ static inline void i40e_write_fd_input_set(struct i40e_pf *pf,
 			  (u32)(val >> 32));
 	i40e_write_rx_ctl(&pf->hw, I40E_PRTQF_FD_INSET(addr, 0),
 			  (u32)(val & 0xFFFFFFFFULL));
+}
+
+/**
+ * i40e_tp4_zerocopy_enabled - Returns true if zerocopy support
+ * is enabled.
+ * @vsi: VSI to check for zerocopy support
+ **/
+static inline bool i40e_tp4_zerocopy_enabled(struct i40e_vsi *vsi)
+{
+	return vsi->flags & I40E_VSI_FLAG_TP4_ZEROCOPY;
 }
 
 /* needed by i40e_ethtool.c */

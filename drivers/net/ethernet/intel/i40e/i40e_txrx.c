@@ -25,6 +25,7 @@
  ******************************************************************************/
 
 #include <linux/prefetch.h>
+#include <linux/tpacket4.h>
 #include <net/busy_poll.h>
 #include <linux/bpf_trace.h>
 #include "i40e.h"
@@ -627,7 +628,20 @@ static void i40e_fd_handle_status(struct i40e_ring *rx_ring,
 static void i40e_unmap_and_free_tx_resource(struct i40e_ring *ring,
 					    struct i40e_tx_buffer *tx_buffer)
 {
-	if (tx_buffer->skb) {
+	if (i40e_tp4_zerocopy_enabled(ring->vsi)) {
+		int err;
+
+		if (ring_is_xdp(ring) && tx_buffer->tp4a_cpl_xdp) {
+			err = tp4a_flush_frame(tx_buffer->tp4a_cpl_xdp,
+					       tx_buffer->tp4_addr, 0, 0, true);
+			WARN_ON_ONCE(err); /* unbalanced deq/enq! */
+			if (dma_unmap_len(tx_buffer, len))
+				dma_unmap_single(ring->dev,
+						 dma_unmap_addr(tx_buffer, dma),
+						 dma_unmap_len(tx_buffer, len),
+						 DMA_TO_DEVICE);
+		}
+	} else if (tx_buffer->skb) {
 		if (tx_buffer->tx_flags & I40E_TX_FLAGS_FD_SB)
 			kfree(tx_buffer->raw_buf);
 		else if (ring_is_xdp(ring))
@@ -648,6 +662,7 @@ static void i40e_unmap_and_free_tx_resource(struct i40e_ring *ring,
 
 	tx_buffer->next_to_watch = NULL;
 	tx_buffer->skb = NULL;
+	tx_buffer->tp4a_cpl_xdp = NULL;
 	dma_unmap_len_set(tx_buffer, len, 0);
 	/* tx_buffer must be completely set up in the transmit path */
 }
@@ -744,6 +759,7 @@ static bool i40e_clean_tx_irq(struct i40e_vsi *vsi,
 	struct i40e_tx_desc *tx_desc;
 	unsigned int total_bytes = 0, total_packets = 0;
 	unsigned int budget = vsi->work_limit;
+	int err;
 
 	tx_buf = &tx_ring->tx_bi[i];
 	tx_desc = I40E_TX_DESC(tx_ring, i);
@@ -773,11 +789,21 @@ static bool i40e_clean_tx_irq(struct i40e_vsi *vsi,
 		total_bytes += tx_buf->bytecount;
 		total_packets += tx_buf->gso_segs;
 
-		/* free the skb/XDP data */
-		if (ring_is_xdp(tx_ring))
-			page_frag_free(tx_buf->raw_buf);
-		else
+		/* free the skb/XDP/TP4 data */
+		if (ring_is_xdp(tx_ring)) {
+			if (i40e_tp4_zerocopy_enabled(vsi)) {
+				err = tp4a_flush_frame(tx_buf->tp4a_cpl_xdp,
+						       tx_buf->tp4_addr,
+						       tx_buf->bytecount, 0,
+						       true);
+				WARN_ON_ONCE(err);
+				tx_buf->tp4a_cpl_xdp = NULL;
+			} else {
+				page_frag_free(tx_buf->raw_buf);
+			}
+		} else {
 			napi_consume_skb(tx_buf->skb, napi_budget);
+		}
 
 		/* unmap skb header data */
 		dma_unmap_single(tx_ring->dev,
@@ -1142,6 +1168,7 @@ err:
 void i40e_clean_rx_ring(struct i40e_ring *rx_ring)
 {
 	unsigned long bi_size;
+	int err;
 	u16 i;
 
 	/* ring already cleared, nothing to do */
@@ -1160,25 +1187,43 @@ void i40e_clean_rx_ring(struct i40e_ring *rx_ring)
 		if (!rx_bi->page)
 			continue;
 
-		/* Invalidate cache lines that may have been written to by
-		 * device so that we avoid corrupting memory.
-		 */
-		dma_sync_single_range_for_cpu(rx_ring->dev,
-					      rx_bi->dma,
-					      rx_bi->page_offset,
-					      rx_ring->rx_buf_len,
-					      DMA_FROM_DEVICE);
+		if (i40e_tp4_zerocopy_enabled(rx_ring->vsi)) {
+			err = tp4a_flush_frame(rx_ring->tp4a_cpl,
+					       rx_bi->tp4_addr, 0, 0, true);
+			WARN_ON_ONCE(err);
+		} else {
+			/* Invalidate cache lines that may have been
+			 * written to by device so that we avoid
+			 * corrupting memory.
+			 */
+			dma_sync_single_range_for_cpu(rx_ring->dev,
+						      rx_bi->dma,
+						      rx_bi->page_offset,
+						      rx_ring->rx_buf_len,
+						      DMA_FROM_DEVICE);
 
-		/* free resources associated with mapping */
-		dma_unmap_page_attrs(rx_ring->dev, rx_bi->dma,
-				     i40e_rx_pg_size(rx_ring),
-				     DMA_FROM_DEVICE,
-				     I40E_RX_DMA_ATTR);
+			/* free resources associated with mapping */
+			dma_unmap_page_attrs(rx_ring->dev, rx_bi->dma,
+					     i40e_rx_pg_size(rx_ring),
+					     DMA_FROM_DEVICE,
+					     I40E_RX_DMA_ATTR);
 
-		__page_frag_cache_drain(rx_bi->page, rx_bi->pagecnt_bias);
+			__page_frag_cache_drain(rx_bi->page,
+						rx_bi->pagecnt_bias);
+		}
 
 		rx_bi->page = NULL;
 		rx_bi->page_offset = 0;
+	}
+
+	if (i40e_tp4_zerocopy_enabled(rx_ring->vsi) && rx_ring->tp4q) {
+		tp4a_end(rx_ring->tp4a_cpl);
+		err = tp4a_flush(rx_ring->tp4a_cpl);
+		WARN_ON_ONCE(err);
+		tp4q_disable(rx_ring->dev, rx_ring->tp4q);
+		tp4a_packet_array_free(rx_ring->tp4a_cpl);
+		tp4a_packet_array_free(rx_ring->tp4a_req);
+		rx_ring->tp4q = NULL;
 	}
 
 	bi_size = sizeof(struct i40e_rx_buffer) * rx_ring->count;
@@ -1286,6 +1331,9 @@ static inline void i40e_release_rx_desc(struct i40e_ring *rx_ring, u32 val)
  */
 static inline unsigned int i40e_rx_offset(struct i40e_ring *rx_ring)
 {
+	if (i40e_tp4_zerocopy_enabled(rx_ring->vsi))
+		return tp4q_get_data_headroom(rx_ring->tp4q);
+
 	return ring_uses_build_skb(rx_ring) ? I40E_SKB_PAD : 0;
 }
 
@@ -1359,6 +1407,47 @@ static void i40e_receive_skb(struct i40e_ring *rx_ring,
 	napi_gro_receive(&q_vector->napi, skb);
 }
 
+static bool i40e_alloc_mapped_page_tp4(struct i40e_ring *rx_ring,
+				       struct i40e_rx_buffer *bi)
+{
+	struct page *page = bi->page;
+	struct tp4_packet pkt;
+	int err;
+
+	if (unlikely(page)) {
+		rx_ring->rx_stats.page_reuse_count++;
+		return true;
+	}
+
+retry:
+	err = tp4a_next_packet_populate(rx_ring->tp4a_req, &pkt);
+	if (unlikely(err)) {
+		rx_ring->rx_stats.alloc_page_failed++;
+		return false;
+	}
+
+	if (unlikely(!tp4p_is_last_frame(&pkt))) {
+		tp4p_set_error(&pkt, EBADF);
+		err = tp4a_flush(rx_ring->tp4a_req);
+		if (err) {
+			WARN_ON_ONCE(err);
+			rx_ring->rx_stats.alloc_page_failed++;
+			return false;
+		}
+		goto retry;
+	}
+
+	bi->tp4_addr = tp4p_get_frame_id(&pkt);
+	if (unlikely(tp4q_get_dma_page_offset(rx_ring->tp4q, bi->tp4_addr,
+					      &bi->dma, &bi->page,
+					      &bi->page_offset))) {
+		rx_ring->rx_stats.alloc_page_failed++;
+		return false;
+	}
+
+	return true;
+}
+
 /**
  * i40e_alloc_rx_buffers - Replace used receive buffers
  * @rx_ring: ring to place buffers on
@@ -1380,8 +1469,12 @@ bool i40e_alloc_rx_buffers(struct i40e_ring *rx_ring, u16 cleaned_count)
 	bi = &rx_ring->rx_bi[ntu];
 
 	do {
-		if (!i40e_alloc_mapped_page(rx_ring, bi))
+		if (i40e_tp4_zerocopy_enabled(rx_ring->vsi)) {
+			if (!i40e_alloc_mapped_page_tp4(rx_ring, bi))
+				goto no_buffers;
+		} else if (!i40e_alloc_mapped_page(rx_ring, bi)) {
 			goto no_buffers;
+		}
 
 		/* sync the buffer for use by the device */
 		dma_sync_single_range_for_device(rx_ring->dev, bi->dma,
@@ -1617,7 +1710,7 @@ static bool i40e_cleanup_headers(struct i40e_ring *rx_ring, struct sk_buff *skb,
 
 {
 	/* XDP packets use error pointer so abort at this point */
-	if (IS_ERR(skb))
+	if (IS_ERR(skb) || i40e_tp4_zerocopy_enabled(rx_ring->vsi))
 		return true;
 
 	/* ERR_MASK will only have valid bits if EOP set, and
@@ -1658,10 +1751,7 @@ static void i40e_reuse_rx_page(struct i40e_ring *rx_ring,
 	rx_ring->next_to_alloc = (nta < rx_ring->count) ? nta : 0;
 
 	/* transfer page from old buffer to new buffer */
-	new_buff->dma		= old_buff->dma;
-	new_buff->page		= old_buff->page;
-	new_buff->page_offset	= old_buff->page_offset;
-	new_buff->pagecnt_bias	= old_buff->pagecnt_bias;
+	*new_buff = *old_buff;
 }
 
 /**
@@ -1704,10 +1794,14 @@ static inline bool i40e_page_is_reusable(struct page *page)
  *
  * In either case, if the page is reusable its refcount is increased.
  **/
-static bool i40e_can_reuse_rx_page(struct i40e_rx_buffer *rx_buffer)
+static bool i40e_can_reuse_rx_page(struct i40e_rx_buffer *rx_buffer,
+				   bool tp4_enabled)
 {
 	unsigned int pagecnt_bias = rx_buffer->pagecnt_bias;
 	struct page *page = rx_buffer->page;
+
+	if (tp4_enabled)
+		return page;
 
 	/* Is any reuse possible? */
 	if (unlikely(!i40e_page_is_reusable(page)))
@@ -1922,11 +2016,13 @@ static struct sk_buff *i40e_build_skb(struct i40e_ring *rx_ring,
 static void i40e_put_rx_buffer(struct i40e_ring *rx_ring,
 			       struct i40e_rx_buffer *rx_buffer)
 {
-	if (i40e_can_reuse_rx_page(rx_buffer)) {
+	bool tp4_enabled = i40e_tp4_zerocopy_enabled(rx_ring->vsi);
+
+	if (i40e_can_reuse_rx_page(rx_buffer, tp4_enabled)) {
 		/* hand second half of page back to the ring */
 		i40e_reuse_rx_page(rx_ring, rx_buffer);
 		rx_ring->rx_stats.page_reuse_count++;
-	} else {
+	} else if (!tp4_enabled) {
 		/* we are not reusing the buffer so unmap it */
 		dma_unmap_page_attrs(rx_ring->dev, rx_buffer->dma,
 				     i40e_rx_pg_size(rx_ring),
@@ -1977,7 +2073,9 @@ static bool i40e_is_non_eop(struct i40e_ring *rx_ring,
 #define I40E_XDP_TX 2
 
 static int i40e_xmit_xdp_ring(struct xdp_buff *xdp,
-			      struct i40e_ring *xdp_ring);
+			      struct i40e_ring *xdp_ring,
+			      struct tp4_packet_array *tp4a_cpl_rx,
+			      u64 tp4_addr);
 
 /**
  * i40e_run_xdp - run an XDP program
@@ -1985,7 +2083,7 @@ static int i40e_xmit_xdp_ring(struct xdp_buff *xdp,
  * @xdp: XDP buffer containing the frame
  **/
 static struct sk_buff *i40e_run_xdp(struct i40e_ring *rx_ring,
-				    struct xdp_buff *xdp)
+				    struct xdp_buff *xdp, u64 tp4_addr)
 {
 	int result = I40E_XDP_PASS;
 	struct i40e_ring *xdp_ring;
@@ -2004,7 +2102,8 @@ static struct sk_buff *i40e_run_xdp(struct i40e_ring *rx_ring,
 		break;
 	case XDP_TX:
 		xdp_ring = rx_ring->vsi->xdp_rings[rx_ring->queue_index];
-		result = i40e_xmit_xdp_ring(xdp, xdp_ring);
+		result = i40e_xmit_xdp_ring(xdp, xdp_ring,
+					    rx_ring->tp4a_cpl, tp4_addr);
 		break;
 	default:
 		bpf_warn_invalid_xdp_action(act);
@@ -2030,15 +2129,66 @@ static void i40e_rx_buffer_flip(struct i40e_ring *rx_ring,
 				struct i40e_rx_buffer *rx_buffer,
 				unsigned int size)
 {
-#if (PAGE_SIZE < 8192)
-	unsigned int truesize = i40e_rx_pg_size(rx_ring) / 2;
+	unsigned int truesize;
 
+	if (i40e_tp4_zerocopy_enabled(rx_ring->vsi)) {
+		/* rx_buffers cannot be flipped in TP4, so we simply
+		 * clear the page member and use this information in
+		 * the reuse functions. If we are in TP4 mode and the
+		 * page is non-NULL, it can be reused.
+		 */
+		rx_buffer->page = NULL;
+	}
+
+#if (PAGE_SIZE < 8192)
+	truesize = i40e_rx_pg_size(rx_ring) / 2;
 	rx_buffer->page_offset ^= truesize;
 #else
-	unsigned int truesize = SKB_DATA_ALIGN(i40e_rx_offset(rx_ring) + size);
-
+	truesize = SKB_DATA_ALIGN(i40e_rx_offset(rx_ring) + size);
 	rx_buffer->page_offset += truesize;
 #endif
+}
+
+static void i40e_tp4_rx(struct i40e_ring *rx_ring,
+			struct i40e_rx_buffer *rx_buffer,
+			struct xdp_buff *xdp,
+			union i40e_rx_desc *rx_desc)
+{
+	u32 size = xdp->data_end - xdp->data;
+	struct tpacket4_hdr *tp4_hdr;
+	bool is_last_frame;
+	int err;
+
+	/* Note that XDP might have moved the data, hence we cannot
+	 * trust the configured TP4 headroom and need to explicity
+	 * calculate it! Also, for now we simply skip setting the
+	 * sockaddr_ll members of the tp4 header.
+	 */
+	tp4_hdr = tp4q_get_header_from_headroom(xdp->data_hard_start);
+	tp4q_write_header_headroom(tp4_hdr, size,
+				   (xdp->data - xdp->data_hard_start));
+
+	is_last_frame =
+		i40e_test_staterr(rx_desc, BIT(I40E_RX_DESC_STATUS_EOF_SHIFT));
+
+	err = tp4a_add_frame(rx_ring->tp4a_cpl,
+			     rx_buffer->tp4_addr,
+			     size, 0, is_last_frame);
+	WARN_ON_ONCE(err);
+
+	rx_buffer->page = NULL;
+}
+
+static void i40e_tp4_complete_rx(struct i40e_ring *rx_ring)
+{
+	int err;
+
+	if (!i40e_tp4_zerocopy_enabled(rx_ring->vsi))
+		return;
+
+	tp4a_end(rx_ring->tp4a_cpl);
+	err = tp4a_flush(rx_ring->tp4a_cpl);
+	WARN_ON_ONCE(err);
 }
 
 /**
@@ -2111,7 +2261,8 @@ static int i40e_clean_rx_irq(struct i40e_ring *rx_ring, int budget)
 					      i40e_rx_offset(rx_ring);
 			xdp.data_end = xdp.data + size;
 
-			skb = i40e_run_xdp(rx_ring, &xdp);
+			skb = i40e_run_xdp(rx_ring, &xdp,
+					   rx_buffer->tp4_addr);
 		}
 
 		if (IS_ERR(skb)) {
@@ -2123,19 +2274,26 @@ static int i40e_clean_rx_irq(struct i40e_ring *rx_ring, int budget)
 			}
 			total_rx_bytes += size;
 			total_rx_packets++;
-		} else if (skb) {
-			i40e_add_rx_frag(rx_ring, rx_buffer, skb, size);
-		} else if (ring_uses_build_skb(rx_ring)) {
-			skb = i40e_build_skb(rx_ring, rx_buffer, &xdp);
+		} else if (i40e_tp4_zerocopy_enabled(rx_ring->vsi)) {
+			i40e_tp4_rx(rx_ring, rx_buffer, &xdp, rx_desc);
+			total_rx_packets++;
+			total_rx_bytes += size;
 		} else {
-			skb = i40e_construct_skb(rx_ring, rx_buffer, &xdp);
-		}
+			if (skb) {
+				i40e_add_rx_frag(rx_ring, rx_buffer, skb, size);
+			} else if (ring_uses_build_skb(rx_ring)) {
+				skb = i40e_build_skb(rx_ring, rx_buffer, &xdp);
+			} else {
+				skb = i40e_construct_skb(rx_ring, rx_buffer,
+							 &xdp);
+			}
 
-		/* exit if we failed to retrieve a buffer */
-		if (!skb) {
-			rx_ring->rx_stats.alloc_buff_failed++;
-			rx_buffer->pagecnt_bias++;
-			break;
+			/* exit if we failed to retrieve a buffer */
+			if (!skb) {
+				rx_ring->rx_stats.alloc_buff_failed++;
+				rx_buffer->pagecnt_bias++;
+				break;
+			}
 		}
 
 		i40e_put_rx_buffer(rx_ring, rx_buffer);
@@ -2184,6 +2342,8 @@ static int i40e_clean_rx_irq(struct i40e_ring *rx_ring, int budget)
 	}
 
 	rx_ring->skb = skb;
+
+	i40e_tp4_complete_rx(rx_ring);
 
 	u64_stats_update_begin(&rx_ring->syncp);
 	rx_ring->stats.packets += total_rx_packets;
@@ -3254,7 +3414,9 @@ dma_error:
  * @xdp_ring: XDP Tx ring
  **/
 static int i40e_xmit_xdp_ring(struct xdp_buff *xdp,
-			      struct i40e_ring *xdp_ring)
+			      struct i40e_ring *xdp_ring,
+			      struct tp4_packet_array *tp4a_cpl_rx,
+			      u64 tp4_addr)
 {
 	u32 size = xdp->data_end - xdp->data;
 	u16 i = xdp_ring->next_to_use;
@@ -3274,7 +3436,12 @@ static int i40e_xmit_xdp_ring(struct xdp_buff *xdp,
 	tx_bi = &xdp_ring->tx_bi[i];
 	tx_bi->bytecount = size;
 	tx_bi->gso_segs = 1;
-	tx_bi->raw_buf = xdp->data;
+	if (i40e_tp4_zerocopy_enabled(xdp_ring->vsi)) {
+		tx_bi->tp4_addr = tp4_addr;
+		tx_bi->tp4a_cpl_xdp = tp4a_cpl_rx;
+	} else {
+		tx_bi->raw_buf = xdp->data;
+	}
 
 	/* record length, and DMA address */
 	dma_unmap_len_set(tx_bi, len, size);
@@ -3433,6 +3600,14 @@ netdev_tx_t i40e_lan_xmit_frame(struct sk_buff *skb, struct net_device *netdev)
 	struct i40e_netdev_priv *np = netdev_priv(netdev);
 	struct i40e_vsi *vsi = np->vsi;
 	struct i40e_ring *tx_ring = vsi->tx_rings[skb->queue_mapping];
+
+	if (i40e_tp4_zerocopy_enabled(vsi)) {
+		/* NOTE: This is nasty. However, if we avoid starting
+		 * the netif tx queues, the tx watch dog will kick in.
+		 */
+		consume_skb(skb);
+		return NETDEV_TX_OK;
+	}
 
 	/* hardware can't handle really short frames, hardware padding works
 	 * beyond this point

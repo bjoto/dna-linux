@@ -25,6 +25,7 @@
  ******************************************************************************/
 
 #include <linux/etherdevice.h>
+#include <linux/tpacket4.h>
 #include <linux/of_net.h>
 #include <linux/pci.h>
 #include <linux/bpf.h>
@@ -2903,6 +2904,41 @@ static void i40e_config_xps_tx_ring(struct i40e_ring *ring)
 }
 
 /**
+ * i40e_enable_tp4_queue - Enables a TP4 queue and associated structures
+ * @ring: Ring to enable the TP4q for
+ * @direction: The direction the DMA data for this ring
+ *
+ * Enables a TP4 queue and associated structures. Also DMA maps
+ * the packet buffers.
+ *
+ * Returns zero on success
+ **/
+static int i40e_enable_tp4_queue(struct i40e_ring *ring,
+				 enum dma_data_direction direction)
+{
+	int err;
+
+	err = tp4q_enable(ring->dev, ring->tp4q, direction);
+	if (err)
+		return err;
+
+	ring->tp4a_req = tp4a_packet_array_new(ring->tp4q,
+					       I40E_DEFAULT_IRQ_WORK * 2);
+	ring->tp4a_cpl = tp4a_packet_array_new(ring->tp4q,
+					       I40E_DEFAULT_IRQ_WORK * 2);
+	if (!ring->tp4a_req || !ring->tp4a_cpl)
+		goto err;
+
+	return 0;
+
+err:
+	tp4q_disable(ring->dev, ring->tp4q);
+	tp4a_packet_array_free(ring->tp4a_cpl);
+	tp4a_packet_array_free(ring->tp4a_req);
+	return -ENOMEM;
+}
+
+/**
  * i40e_configure_tx_ring - Configure a transmit ring context and rest
  * @ring: The Tx ring to configure
  *
@@ -3070,6 +3106,13 @@ static int i40e_configure_rx_ring(struct i40e_ring *ring)
 	ring->tail = hw->hw_addr + I40E_QRX_TAIL(pf_q);
 	writel(0, ring->tail);
 
+	if (i40e_tp4_zerocopy_enabled(vsi)) {
+		ring->tp4q = vsi->tp4q_rx;
+		err = i40e_enable_tp4_queue(ring, DMA_FROM_DEVICE);
+		if (err)
+			return err;
+	}
+
 	i40e_alloc_rx_buffers(ring, I40E_DESC_UNUSED(ring));
 
 	return 0;
@@ -3109,19 +3152,38 @@ static int i40e_vsi_configure_rx(struct i40e_vsi *vsi)
 	int err = 0;
 	u16 i;
 
-	if (!vsi->netdev || (vsi->back->flags & I40E_FLAG_LEGACY_RX)) {
+	if (i40e_tp4_zerocopy_enabled(vsi)) {
+		unsigned int fs;
+
+		/* We need to narrow down the frame size, if it's
+		 * larger than the supported I40E_MAX_RXBUFFER
+		 * size. Also, the length is described in 128B chunks,
+		 * so we need to adjust the length, such that we don't
+		 * write outside of our bounds.
+		 */
+		fs = min_t(unsigned int,
+			   tp4q_max_data_size(vsi->tp4q_rx),
+			   I40E_MAX_RXBUFFER) &
+		     ~(BIT(I40E_RXQ_CTX_DBUFF_SHIFT) - 1);
+
 		vsi->max_frame = I40E_MAX_RXBUFFER;
-		vsi->rx_buf_len = I40E_RXBUFFER_2048;
-#if (PAGE_SIZE < 8192)
-	} else if (!I40E_2K_TOO_SMALL_WITH_PADDING &&
-		   (vsi->netdev->mtu <= ETH_DATA_LEN)) {
-		vsi->max_frame = I40E_RXBUFFER_1536 - NET_IP_ALIGN;
-		vsi->rx_buf_len = I40E_RXBUFFER_1536 - NET_IP_ALIGN;
-#endif
+		vsi->rx_buf_len = fs;
 	} else {
-		vsi->max_frame = I40E_MAX_RXBUFFER;
-		vsi->rx_buf_len = (PAGE_SIZE < 8192) ? I40E_RXBUFFER_3072 :
-						       I40E_RXBUFFER_2048;
+		if (!vsi->netdev || (vsi->back->flags & I40E_FLAG_LEGACY_RX)) {
+			vsi->max_frame = I40E_MAX_RXBUFFER;
+			vsi->rx_buf_len = I40E_RXBUFFER_2048;
+#if (PAGE_SIZE < 8192)
+		} else if (!I40E_2K_TOO_SMALL_WITH_PADDING &&
+			   (vsi->netdev->mtu <= ETH_DATA_LEN)) {
+			vsi->max_frame = I40E_RXBUFFER_1536 - NET_IP_ALIGN;
+			vsi->rx_buf_len = I40E_RXBUFFER_1536 - NET_IP_ALIGN;
+#endif
+		} else {
+			vsi->max_frame = I40E_MAX_RXBUFFER;
+			vsi->rx_buf_len = (PAGE_SIZE < 8192) ?
+					  I40E_RXBUFFER_3072 :
+					  I40E_RXBUFFER_2048;
+		}
 	}
 
 	/* set up individual rings */
@@ -8790,6 +8852,10 @@ int i40e_reconfig_rss_queues(struct i40e_pf *pf, int queue_count)
 	if (!(pf->flags & I40E_FLAG_RSS_ENABLED))
 		return 0;
 
+	/* Cannot change number of queue pairs while in TP4 ZC */
+	if (i40e_tp4_zerocopy_enabled(vsi))
+		return 0;
+
 	new_rss_size = min_t(int, queue_count, pf->rss_size_max);
 
 	if (queue_count != vsi->num_queue_pairs) {
@@ -9612,6 +9678,8 @@ static int i40e_xdp_setup(struct i40e_vsi *vsi,
  * i40e_xdp - implements ndo_xdp for i40e
  * @dev: netdevice
  * @xdp: XDP command
+ *
+ * Returns zero on success
  **/
 static int i40e_xdp(struct net_device *dev,
 		    struct netdev_xdp *xdp)
@@ -9631,6 +9699,128 @@ static int i40e_xdp(struct net_device *dev,
 		return 0;
 	default:
 		return -EINVAL;
+	}
+}
+
+/**
+ * i40e_tp4_disable - disables zerocopy
+ * @netdev: netdevice
+ * @params: tp4 params
+ *
+ * Returns zero on success
+ **/
+static int i40e_tp4_disable(struct net_device *netdev,
+			    struct tp4_netdev_parms *params)
+{
+	struct i40e_netdev_priv *np = netdev_priv(netdev);
+	struct i40e_vsi *vsi = np->vsi;
+	struct i40e_pf *pf = vsi->back;
+	int ret;
+
+	dev_info(&pf->pdev->dev, "disabled TP4 zerocopy, failed Rx allocations: %llu\n",
+		 vsi->rx_rings[0]->rx_stats.alloc_page_failed);
+
+	i40e_prep_for_reset(pf, true /*rtnl_lock acquired */);
+
+	vsi->flags &= ~I40E_VSI_FLAG_TP4_ZEROCOPY;
+
+	i40e_reset_and_rebuild(pf, false, true /*rtnl_lock acquired */);
+
+	/* Restore previous queue count. */
+	if (vsi->prev_queue_pairs != 1) {
+		ret = i40e_reconfig_rss_queues(pf, vsi->prev_queue_pairs);
+		if (ret <= 0) {
+			dev_err(&pf->pdev->dev,
+				"Failed to restore previous queue count! i40e_reconfig_rss_queues returned %d!\n",
+				ret);
+		}
+	}
+
+	return 0;
+}
+
+/**
+ * i40e_tp4_enable - enables zerocopy
+ * @netdev: netdevice
+ * @params: tp4 params
+ *
+ * Returns zero on success
+ **/
+static int i40e_tp4_enable(struct net_device *netdev,
+			   struct tp4_netdev_parms *params)
+{
+	struct i40e_netdev_priv *np = netdev_priv(netdev);
+	struct i40e_vsi *vsi = np->vsi;
+	struct i40e_pf *pf = vsi->back;
+	int ret;
+
+	if (vsi->type != I40E_VSI_MAIN)
+		return -EINVAL;
+
+	if (vsi->flags & I40E_VSI_FLAG_TP4_ZEROCOPY)
+		return -EBUSY;
+
+	if (!params->tp4q_rx || !params->tp4q_tx)
+		return -EINVAL;
+
+	vsi->prev_queue_pairs = (vsi->req_queue_pairs > 0) ?
+				vsi->req_queue_pairs : vsi->num_queue_pairs;
+	/* In TP4 mode we only deal with one queue pair */
+	if (vsi->prev_queue_pairs != 1) {
+		ret = i40e_reconfig_rss_queues(pf, 1);
+		if (ret <= 0)
+			return -EINVAL;
+	}
+
+	/* Re-validate Rx headroom */
+	if (I40E_MAX_RXBUFFER - params->tp4q_rx->umem->header_headroom -
+	    TPACKET4_HDRLEN - params->tp4q_rx->umem->data_headroom -
+	    TP4_UMEM_MIN_PACKET_DATA <= 0) {
+		return -EINVAL;
+	}
+
+	i40e_prep_for_reset(pf, true /*rtnl_lock acquired */);
+
+	vsi->tp4q_rx = params->tp4q_rx;
+	vsi->tp4q_tx = params->tp4q_tx;
+	vsi->flags |= I40E_VSI_FLAG_TP4_ZEROCOPY;
+
+	i40e_reset_and_rebuild(pf, false, true /*rtnl_lock acquired */);
+
+	/* Since i40e_reset_and_rebuild does not return any error
+	 * codes, check that the packet_zerocopy allocations
+	 * succeeded.
+	 */
+	if (!vsi->tp4q_rx->dma_info && !vsi->tp4q_tx->dma_info) {
+		vsi->flags &= ~I40E_VSI_FLAG_TP4_ZEROCOPY;
+		ret = -EBUSY;
+	} else {
+		ret = 0;
+	}
+
+	dev_info(&pf->pdev->dev, "enabled TP4 zerocopy\n");
+	return ret;
+}
+
+/**
+ * i40e_tp4_zerocopy - enables/disables zerocopy
+ * @netdev: netdevice
+ * @params: tp4 params
+ *
+ * Returns zero on success
+ **/
+static int i40e_tp4_zerocopy(struct net_device *netdev,
+			     struct tp4_netdev_parms *params)
+{
+	switch (params->command) {
+	case TP4_ENABLE:
+		return i40e_tp4_enable(netdev, params);
+
+	case TP4_DISABLE:
+		return i40e_tp4_disable(netdev, params);
+
+	default:
+		return -ENOTSUPP;
 	}
 }
 
@@ -9667,6 +9857,7 @@ static const struct net_device_ops i40e_netdev_ops = {
 	.ndo_bridge_getlink	= i40e_ndo_bridge_getlink,
 	.ndo_bridge_setlink	= i40e_ndo_bridge_setlink,
 	.ndo_xdp		= i40e_xdp,
+	.ndo_tp4_zerocopy	= i40e_tp4_zerocopy,
 };
 
 /**
