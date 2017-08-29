@@ -89,11 +89,16 @@
 #include <linux/errqueue.h>
 #include <linux/net_tstamp.h>
 #include <linux/percpu.h>
+#include <linux/log2.h>
 #ifdef CONFIG_INET
 #include <net/inet_common.h>
 #endif
 #include <linux/bpf.h>
 #include <net/compat.h>
+
+#include <linux/sched/mm.h>
+#include <linux/sched/task.h>
+#include <linux/sched/signal.h>
 
 #include "internal.h"
 
@@ -2969,6 +2974,133 @@ static int packet_sendmsg(struct socket *sock, struct msghdr *msg, size_t len)
 		return packet_snd(sock, msg, len);
 }
 
+static void
+packet_umem_unpin_pages(struct tp4_umem *umem)
+{
+	unsigned int i;
+
+	for (i = 0; i < umem->npgs; i++) {
+		struct page *page = umem->pgs[i];
+
+		set_page_dirty_lock(page);
+		put_page(page);
+	}
+	kfree(umem->pgs);
+	umem->pgs = NULL;
+}
+
+static void
+packet_umem_free(struct tp4_umem *umem)
+{
+	struct mm_struct *mm;
+	struct task_struct *task;
+	unsigned long diff;
+
+	packet_umem_unpin_pages(umem);
+
+	task = get_pid_task(umem->pid, PIDTYPE_PID);
+	put_pid(umem->pid);
+	if (!task)
+		goto out;
+	mm = get_task_mm(task);
+	put_task_struct(task);
+	if (!mm)
+		goto out;
+
+	diff = umem->size >> PAGE_SHIFT;
+
+	down_write(&mm->mmap_sem);
+	mm->pinned_vm -= diff;
+	up_write(&mm->mmap_sem);
+	mmput(mm);
+out:
+	kfree(umem);
+}
+
+static struct tp4_umem *
+packet_umem_new(unsigned long addr, size_t size, unsigned int frame_size,
+		unsigned int header_headroom, unsigned int data_headroom)
+{
+	unsigned long lock_limit, locked, npages;
+	unsigned int gup_flags = FOLL_WRITE;
+	int need_release = 0, j = 0, i, ret;
+	struct page **page_list;
+	struct tp4_umem *umem;
+
+	if (!can_do_mlock())
+		return ERR_PTR(-EPERM);
+
+	umem = tp4q_new_umem(addr, size, frame_size, header_headroom,
+			     data_headroom);
+	if (IS_ERR(umem))
+		return umem;
+
+	page_list = (struct page **)__get_free_page(GFP_KERNEL);
+	if (!page_list) {
+		put_pid(umem->pid);
+		kfree(umem);
+		return ERR_PTR(-ENOMEM);
+	}
+
+	npages = PAGE_ALIGN(umem->nframes * umem->frame_size) >> PAGE_SHIFT;
+
+	down_write(&current->mm->mmap_sem);
+
+	locked = npages + current->mm->pinned_vm;
+	lock_limit = rlimit(RLIMIT_MEMLOCK) >> PAGE_SHIFT;
+
+	if ((locked > lock_limit) && !capable(CAP_IPC_LOCK)) {
+		ret = -ENOMEM;
+		goto out;
+	}
+
+	if (npages == 0 || npages > UINT_MAX) {
+		ret = -EINVAL;
+		goto out;
+	}
+
+	umem->pgs = kcalloc(npages, sizeof(*umem->pgs), GFP_KERNEL);
+	if (!umem->pgs) {
+		ret = -ENOMEM;
+		goto out;
+	}
+
+	need_release = 1;
+	while (npages) {
+		ret = get_user_pages(addr,
+				     min_t(unsigned long, npages,
+					   PAGE_SIZE / sizeof(struct page *)),
+				     gup_flags, page_list, NULL);
+
+		if (ret < 0)
+			goto out;
+
+		umem->npgs += ret;
+		addr += ret * PAGE_SIZE;
+		npages -= ret;
+
+		for (i = 0; i < ret; i++)
+			umem->pgs[j++] = page_list[i];
+	}
+
+	ret = 0;
+
+out:
+	if (ret < 0) {
+		if (need_release)
+			packet_umem_unpin_pages(umem);
+		put_pid(umem->pid);
+		kfree(umem);
+	} else {
+		current->mm->pinned_vm = locked;
+	}
+
+	up_write(&current->mm->mmap_sem);
+	free_page((unsigned long)page_list);
+
+	return ret < 0 ? ERR_PTR(ret) : umem;
+}
+
 /*
  *	Close a PACKET socket. This is fairly simple. We immediately go
  *	to 'closed' state and remove our protocol entry in the device list.
@@ -3016,6 +3148,11 @@ static int packet_release(struct socket *sock)
 	if (po->tx_ring.pg_vec) {
 		memset(&req_u, 0, sizeof(req_u));
 		packet_set_ring(sk, &req_u, 1, 1);
+	}
+
+	if (po->umem) {
+		packet_umem_free(po->umem);
+		po->umem = NULL;
 	}
 
 	f = fanout_release(sk);
@@ -3820,6 +3957,31 @@ packet_setsockopt(struct socket *sock, int level, int optname, char __user *optv
 		po->xmit = val ? packet_direct_xmit : dev_queue_xmit;
 		return 0;
 	}
+	case PACKET_MEMREG:
+	{
+		struct tpacket_memreg_req req;
+		struct tp4_umem *umem;
+
+		if (optlen < sizeof(req))
+			return -EINVAL;
+		if (copy_from_user(&req, optval, sizeof(req)))
+			return -EFAULT;
+
+		umem = packet_umem_new(req.addr, req.len, req.frame_size,
+				       req.header_headroom, req.data_headroom);
+		if (IS_ERR(umem))
+			return PTR_ERR(umem);
+
+		lock_sock(sk);
+		if (po->umem) {
+			release_sock(sk);
+			packet_umem_free(umem);
+			return -EBUSY;
+		}
+		po->umem = umem;
+		release_sock(sk);
+		return 0;
+	}
 	default:
 		return -ENOPROTOOPT;
 	}
@@ -4231,6 +4393,9 @@ static int packet_set_ring(struct sock *sk, union tpacket_req_u *req_u,
 		case TPACKET_V3:
 			po->tp_hdrlen = TPACKET3_HDRLEN;
 			break;
+		default:
+			err = -EINVAL;
+			goto out;
 		}
 
 		err = -EINVAL;

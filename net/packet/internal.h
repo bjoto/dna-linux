@@ -2,6 +2,7 @@
 #define __PACKET_INTERNAL_H__
 
 #include <linux/refcount.h>
+#include <linux/tpacket4.h>
 
 struct packet_mclist {
 	struct packet_mclist	*next;
@@ -109,6 +110,9 @@ struct packet_sock {
 	union  tpacket_stats_u	stats;
 	struct packet_ring_buffer	rx_ring;
 	struct packet_ring_buffer	tx_ring;
+
+	struct tp4_umem		*umem;
+
 	int			copy_thresh;
 	spinlock_t		bind_lock;
 	struct mutex		pg_vec_lock;
