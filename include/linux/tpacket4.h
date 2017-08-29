@@ -19,6 +19,7 @@
 #include <linux/if_packet.h>
 #include <linux/slab.h>
 #include <linux/dma-mapping.h>
+#include <linux/log2.h>
 
 #define TP4_UMEM_MIN_FRAME_SIZE 2048
 #define TP4_UMEM_MIN_PACKET_DATA 1536
@@ -54,6 +55,39 @@ struct tp4_queue {
 	struct tp4_dma_info *dma_info;
 	enum dma_data_direction direction;
 	spinlock_t tx_lock; /* used in copy mode when completing from skb dtor */
+};
+
+/**
+ * struct tp4_packet_array - An array of packets
+ * @tp4q: the tp4q associated with this packet array. Flushes and
+ *	  populates will operate on this.
+ * @start: the first packet that has not been processed
+ * @curr: the packet that is currently being processed
+ * @end: the last packet in the array
+ * @mask: convenience variable for internal operations on the array
+ * @items: the actual descriptors to frames/packets that are in the array
+ **/
+struct tp4_packet_array {
+	struct tp4_queue *tp4q;
+	u32 start;
+	u32 curr;
+	u32 end;
+	u32 mask;
+	struct tpacket4_desc items[0];
+};
+
+/**
+ * struct tp4_packet - A packet consisting of one or more frames
+ * @pkt_arr: the packet array this packet is located in
+ * @start: the first frame that has not been processed
+ * @curr: the frame that is currently being processed
+ * @end: the last frame in the packet
+ **/
+struct tp4_packet {
+	struct tp4_packet_array *pkt_arr;
+	u32 start;
+	u32 curr;
+	u32 end;
 };
 
 enum tp4_netdev_command {
@@ -228,6 +262,29 @@ static inline int tp4q_dequeue(struct tp4_queue *q,
 /**
  *
  **/
+static inline int tp4q_dequeue_to_ring(struct tp4_queue *q,
+				       struct tpacket4_desc *d,
+				       u32 start, u32 dcnt, u32 mask)
+{
+	unsigned int idx;
+	int i, entries;
+
+	entries = tp4q_nb_avail(q, dcnt);
+	q->num_free += entries;
+
+	/* Order flags and data */
+	smp_rmb();
+
+	for (i = 0; i < entries; i++) {
+		idx = (q->last_avail_idx++) & (q->ring_size - 1);
+		d[start++ & mask] = q->vring[idx];
+	}
+	return entries;
+}
+
+/**
+ *
+ **/
 static inline int tp4q_enqueue(struct tp4_queue *q,
 			       const struct tpacket4_desc *d, int dcnt)
 {
@@ -254,6 +311,42 @@ static inline int tp4q_enqueue(struct tp4_queue *q,
 		unsigned int idx = (q->used_idx++) & (q->ring_size - 1);
 
 		q->vring[idx].flags = d[i].flags & ~DESC_HW;
+	}
+	return 0;
+}
+
+/**
+ *
+ **/
+static inline int tp4q_enqueue_from_ring(struct tp4_queue *q,
+					 const struct tpacket4_desc *d,
+					 u32 start, u32 dcnt, u32 mask)
+{
+	unsigned int used_idx = q->used_idx;
+	u32 didx = start;
+	int i;
+
+	if (q->num_free < dcnt)
+		return -ENOSPC;
+
+	q->num_free -= dcnt;
+
+	for (i = 0; i < dcnt; i++) {
+		unsigned int idx = (used_idx++) & (q->ring_size - 1);
+
+		q->vring[idx].addr = d[didx & mask].addr;
+		q->vring[idx].len = d[didx & mask].len;
+		q->vring[idx].error = d[didx & mask].error;
+		didx++;
+	}
+
+	/* Order flags and data */
+	smp_wmb();
+
+	for (i = 0; i < dcnt; i++) {
+		unsigned int idx = (q->used_idx++) & (q->ring_size - 1);
+
+		q->vring[idx].flags = d[start++ & mask].flags & ~DESC_HW;
 	}
 	return 0;
 }
@@ -328,11 +421,29 @@ static inline struct tpacket4_hdr *tp4q_get_validated_header(
 /**
  *
  **/
+static inline void tp4q_write_header_headroom(struct tpacket4_hdr *hdr,
+					      u32 size, u32 headroom)
+{
+	hdr->data = TPACKET4_HDRLEN + headroom;
+	hdr->data_end = hdr->data + size;
+}
+
+/**
+ *
+ **/
 static inline void tp4q_write_header(struct tp4_queue *tp4q,
 				     struct tpacket4_hdr *hdr, u32 size)
 {
-	hdr->data = TPACKET4_HDRLEN + tp4q->umem->data_headroom;
-	hdr->data_end = hdr->data + size;
+	tp4q_write_header_headroom(hdr, size, tp4q->umem->data_headroom);
+}
+
+/**
+ *
+ **/
+static inline
+struct tpacket4_hdr *tp4q_get_header_from_headroom(void *data)
+{
+	return (struct tpacket4_hdr *)(data - TPACKET4_HDRLEN);
 }
 
 /**
@@ -480,5 +591,421 @@ static inline void *tp4q_get_data(struct tp4_queue *tp4q,
 	return (u8 *)hdr + TPACKET4_HDRLEN + tp4q->umem->data_headroom;
 }
 
+/**
+ *
+ **/
+static inline int tp4q_get_dma_page_offset(struct tp4_queue *tp4q, u64 addr,
+					   dma_addr_t *dma, struct page **page,
+					   u32 *page_offset)
+{
+	u64 pg, off;
+
+	if (!tp4_get_page_offset(tp4q, addr, &pg, &off))
+		return -1;
+
+	*dma = tp4q->dma_info[pg].dma;
+	*page = tp4q->dma_info[pg].page;
+	*page_offset = off + tp4q->umem->header_headroom +
+		       TPACKET4_HDRLEN + tp4q->umem->data_headroom;
+
+	return 0;
+}
+
+/**
+ *
+ **/
+static inline int tp4q_get_header_dma(struct tp4_queue *tp4q, u64 addr,
+				      dma_addr_t *dma)
+{
+	u64 pg, off;
+
+	if (!tp4_get_page_offset(tp4q, addr, &pg, &off)) {
+		*dma = 0;
+		return -1;
+	}
+
+	*dma = tp4q->dma_info[pg].dma + off + tp4q->umem->header_headroom;
+	return 0;
+}
+
+/**
+ *
+ **/
+static inline unsigned int tp4q_get_data_headroom(struct tp4_queue *tp4q)
+{
+	return tp4q->umem->data_headroom;
+}
+
+/**
+ * tp4a_packet_array_new - Create new packet array
+ * @tp4q: The tp4_queue object to be associated with this packet array
+ * @elems: number of elements in the packet array
+ *
+ * Returns a reference to the new packet array or NULL for failure
+ **/
+static inline
+struct tp4_packet_array *
+tp4a_packet_array_new(struct tp4_queue *tp4q,
+		      size_t elems)
+{
+	struct tp4_packet_array *arr;
+
+	if (!is_power_of_2(elems))
+		return NULL;
+
+	arr = kzalloc(sizeof(*arr) + elems * sizeof(struct tpacket4_desc),
+		      GFP_KERNEL);
+	if (!arr)
+		return NULL;
+
+	arr->tp4q = tp4q;
+	arr->mask = elems - 1;
+	return arr;
+}
+
+/**
+ * tp4a_num_items - Number of packets in array
+ * @a: pointer to packet array
+ *
+ * Returns the number of packets currently in the array
+ **/
+static inline
+u32 tp4a_num_items(struct tp4_packet_array *a)
+{
+	return a->end - a->curr;
+}
+
+/**
+ * tp4a_packet_array_free - Destroy packet array
+ * @a: pointer to packet array
+ **/
+static inline
+void tp4a_packet_array_free(struct tp4_packet_array *a)
+{
+	kfree(a);
+}
+
+/**
+ * tp4a_populate - Populate an array with packets from associated tp4q
+ * @a: pointer to packet array
+ **/
+static inline
+void tp4a_populate(struct tp4_packet_array *a)
+{
+	u32 cnt, free = a->mask + 1 - (a->end - a->start);
+
+	if (free == 0)
+		return; /* no space! */
+
+	cnt = tp4q_dequeue_to_ring(a->tp4q, &a->items[0], a->end, free,
+				   a->mask);
+	a->end += cnt;
+}
+
+/**
+ * tp4a_discard - Drop all packets in packet array up to current packet
+ * @a: pointer to packet array
+ **/
+static inline
+void tp4a_discard(struct tp4_packet_array *a)
+{
+	a->start = a->curr;
+}
+
+/**
+ * tp4a_reset - Start to traverse the packets in the array from the beginning
+ * @a: pointer to packet array
+ **/
+static inline
+void tp4a_reset(struct tp4_packet_array *a)
+{
+	a->curr = a->start;
+}
+
+/**
+ * tp4a_end - Skip traversing rest of packets, but do not drop them
+ * @a: pointer to packet array
+ **/
+static inline
+void tp4a_end(struct tp4_packet_array *a)
+{
+	a->curr = a->end;
+}
+
+/**
+ * tp4a_flush - Flush processed packets to associated tp4q
+ * @a: pointer to packet array
+ *
+ * Returns 0 for success and -1 for failure
+ **/
+static inline
+int tp4a_flush(struct tp4_packet_array *a)
+{
+	u32 avail = a->curr - a->start;
+	int ret;
+
+	if (avail == 0)
+		return 0; /* nothing to flush */
+
+	ret = tp4q_enqueue_from_ring(a->tp4q, &a->items[0], a->start, avail,
+				     a->mask);
+	if (ret < 0)
+		return -1;
+
+	tp4a_discard(a);
+	return 0;
+}
+
+/**
+ * tp4a_next_packet - Get next packet in array
+ * @a: pointer to packet array
+ * @p: supplied pointer to packet structure that is filled in by function
+ *
+ * Returns 0 for success and -1 for failure
+ **/
+static inline
+int tp4a_next_packet(struct tp4_packet_array *a, struct tp4_packet *p)
+{
+	u32 avail = a->end - a->curr;
+
+	if (avail == 0)
+		return -1; /* empty */
+
+	p->pkt_arr = a;
+	p->start = a->curr;
+	p->curr = a->curr;
+	p->end = a->curr;
+
+	/* XXX Sanity check for too-many-frames packets? */
+	while (a->items[p->end++ & a->mask].flags & DESC_NEXT) {
+		avail--;
+		if (avail == 0)
+			return -1;
+	}
+
+	a->curr += (p->end - p->start);
+	return 0;
+}
+
+
+/**
+ * tp4a_next_packet_populate - Get next packet and populate array if empty
+ * @a: pointer to packet array
+ * @p: supplied pointer to packet structure that is filled in by function
+ *
+ * Returns 0 for success and -1 for failure
+ **/
+static inline
+int tp4a_next_packet_populate(struct tp4_packet_array *a, struct tp4_packet *p)
+{
+	int err;
+
+	err = tp4a_next_packet(a, p);
+	if (err) {
+		tp4a_discard(a);
+		tp4a_populate(a);
+		err = tp4a_next_packet(a, p);
+	}
+
+	return err;
+}
+
+/**
+ * tp4a_add_frame - Add a frame to a packet array
+ * @a: pointer to packet array
+ * @addr: index of in packet buffer that this frame should point to
+ * @len: the length in bytes of the data in the frame
+ * @errno: >0 if an errno should be returned, otherwise 0
+ * @is_last_frame: Set if this is the last frame of the packet
+ *
+ * Returns 0 for success and -1 for failure
+ **/
+static inline
+int tp4a_add_frame(struct tp4_packet_array *a,
+		   u64 addr, u32 len, int errno, bool is_last_frame)
+{
+	u32 free = a->mask + 1 - (a->end - a->start);
+
+	if (free == 0)
+		return -1; /* full */
+
+	a->items[a->end & a->mask].addr = addr;
+	a->items[a->end & a->mask].len = len;
+	a->items[a->end & a->mask].flags = is_last_frame ? 0 : DESC_NEXT;
+	a->items[a->end & a->mask].error = errno;
+
+	a->end++;
+	return 0;
+}
+
+/**
+ * tp4a_flush_frame - Adds frame and flushes it to associated tp4q
+ * @a: pointer to packet array
+ * @addr: index of in packet buffer that this frame should point to
+ * @len: the length in bytes of the data in the frame
+ * @errno: >0 if an errno should be returned, otherwise 0
+ * @is_last_frame: Set if this is the last frame of the packet
+ *
+ * Returns 0 for success and -1 for failure
+ **/
+static inline
+int tp4a_flush_frame(struct tp4_packet_array *a,
+		     u64 addr, u32 len, int errno, bool is_last_frame)
+{
+	struct tpacket4_desc desc;
+	int err;
+
+	desc.addr = addr;
+	desc.len = len;
+	desc.flags = is_last_frame ? 0 : DESC_NEXT;
+	desc.error = errno;
+
+	err = tp4q_enqueue(a->tp4q, &desc, 1);
+	return err;
+}
+
+/* Packet operations; One packet is one or more frames. */
+
+/**
+ * tp4p_reset - Start to traverse the frames in the packet from the beginning
+ * @p: pointer to packet
+ **/
+static inline
+void tp4p_reset(struct tp4_packet *p)
+{
+	p->curr = p->start;
+}
+
+/**
+ * tp4p_last - Go to last frame in packet
+ * @p: pointer to packet
+ **/
+static inline
+void tp4p_last(struct tp4_packet *p)
+{
+	p->curr = p->end - 1;
+}
+
+/**
+ * tp4p_next_frame - Go to next frame in packet
+ * @p: pointer to packet
+ *
+ * Returns -1 if there are no more frames in the packet, otherwise 0
+ **/
+static inline
+int tp4p_next_frame(struct tp4_packet *p)
+{
+	if (p->curr + 1 == p->end)
+		return -1;
+
+	p->curr++;
+	return 0;
+}
+
+/**
+ * tp4p_prev_frame - Go to previous frame in packet
+ * @p: pointer to packet
+ *
+ * Returns 1 if there is no earlier frame in this packet, otherwise 0
+ **/
+static inline
+int tp4p_prev_frame(struct tp4_packet *p)
+{
+	if (p->curr == p->start)
+		return -1;
+
+	p->curr--;
+	return 0;
+}
+
+/**
+ * tp4p_get_frame_id - Get packet buffer id of frame
+ * @p: pointer to packet
+ *
+ * Returns the id of the packet buffer of the current frame
+ **/
+static inline
+u64 tp4p_get_frame_id(struct tp4_packet *p)
+{
+	return p->pkt_arr->items[p->curr & p->pkt_arr->mask].addr;
+}
+
+/**
+ * tp4p_get_frame_len - Get length of data in current frame
+ * @p: pointer to packet
+ *
+ * Returns the length of data in the packet buffer of the current frame
+ **/
+static inline
+u32 tp4p_get_frame_len(struct tp4_packet *p)
+{
+	return p->pkt_arr->items[p->curr & p->pkt_arr->mask].len;
+}
+
+/**
+ * tp4p_set_error - Set an error on the current frame
+ * @p: pointer to packet
+ * @errno: the errno to be assigned.
+ **/
+static inline
+void tp4p_set_error(struct tp4_packet *p, int errno)
+{
+	p->pkt_arr->items[p->curr & p->pkt_arr->mask].error = errno;
+}
+
+/**
+ * tp4p_is_last_frame - Is this the last frame of the packet
+ * @p: pointer to packet
+ *
+ * Returns true if this is the last frame of the packet, otherwise 0
+ **/
+static inline
+bool tp4p_is_last_frame(struct tp4_packet *p)
+{
+	return p->curr + 1 == p->end;
+}
+
+/**
+ * tp4p_num_frames - Number of frames in a packet
+ * @p: pointer to packet
+ *
+ * Returns the number of frames this packet consists of
+ **/
+static inline
+u32 tp4p_num_frames(struct tp4_packet *p)
+{
+	return p->end - p->start;
+}
+
+/**
+ * tp4a_add_packet - Adds a packet to a packet array
+ * @a: pointer to packet array
+ * @p: pointer to packet to insert
+ * @errno: >0 if packet should be marked with an errno, otherwise 0
+ *
+ * Returns 0 for success and -1 for failure
+ **/
+static inline
+int tp4a_add_packet(struct tp4_packet_array *a, struct tp4_packet *p, int errno)
+{
+	u32 free = a->mask + 1 - (a->end - a->start);
+	u32 nframes = p->end - p->start;
+
+	if (nframes > free)
+		return -1;
+
+	tp4p_reset(p);
+
+	do {
+		a->items[a->end & a->mask].addr = tp4p_get_frame_id(p);
+		a->items[a->end & a->mask].len = tp4p_get_frame_len(p);
+		a->items[a->end & a->mask].flags = tp4p_is_last_frame(0) ?
+						   0 : DESC_NEXT;
+		a->items[a->end & a->mask].error = errno;
+		a->end++;
+	} while (tp4p_next_frame(p) == 0);
+
+	return 0;
+}
 
 #endif /* _LINUX_TPACKET4_H */
