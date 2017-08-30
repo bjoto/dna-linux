@@ -3533,6 +3533,140 @@ static void ixgbe_set_source_address_pruning_X550(struct ixgbe_hw *hw,
 }
 
 /**
+ *  ixgbe_disable_mdd_X550
+ *  @hw: pointer to hardware structure
+ *
+ *  Disable malicious driver detection
+ **/
+static void ixgbe_disable_mdd_X550(struct ixgbe_hw *hw)
+{
+	u32 reg;
+
+	/* Disable MDD for TX DMA and interrupt */
+	reg = IXGBE_READ_REG(hw, IXGBE_DMATXCTL);
+	reg &= ~(IXGBE_DMATXCTL_MDP_EN | IXGBE_DMATXCTL_MBINTEN);
+	IXGBE_WRITE_REG(hw, IXGBE_DMATXCTL, reg);
+
+	/* Disable MDD for RX and interrupt */
+	reg = IXGBE_READ_REG(hw, IXGBE_RDRXCTL);
+	reg &= ~(IXGBE_RDRXCTL_MDP_EN | IXGBE_RDRXCTL_MBINTEN);
+	IXGBE_WRITE_REG(hw, IXGBE_RDRXCTL, reg);
+}
+
+/**
+ *  ixgbe_enable_mdd_X550
+ *  @hw: pointer to hardware structure
+ *
+ *  Enable malicious driver detection
+ **/
+static void ixgbe_enable_mdd_X550(struct ixgbe_hw *hw)
+{
+	u32 reg;
+
+	/* Enable MDD for TX DMA and interrupt */
+	reg = IXGBE_READ_REG(hw, IXGBE_DMATXCTL);
+	reg |= (IXGBE_DMATXCTL_MDP_EN | IXGBE_DMATXCTL_MBINTEN);
+	IXGBE_WRITE_REG(hw, IXGBE_DMATXCTL, reg);
+
+	/* Enable MDD for RX and interrupt */
+	reg = IXGBE_READ_REG(hw, IXGBE_RDRXCTL);
+	reg |= (IXGBE_RDRXCTL_MDP_EN | IXGBE_RDRXCTL_MBINTEN);
+	IXGBE_WRITE_REG(hw, IXGBE_RDRXCTL, reg);
+}
+
+/**
+ *  ixgbe_restore_mdd_vf_X550
+ *  @hw: pointer to hardware structure
+ *  @vf: vf index
+ *
+ *  Restore VF that was disabled during malicious driver detection event
+ **/
+static void ixgbe_restore_mdd_vf_X550(struct ixgbe_hw *hw, u32 vf)
+{
+	u32 idx, reg, num_qs, start_q, bitmask;
+
+	/* Map VF to queues */
+	reg = IXGBE_READ_REG(hw, IXGBE_MRQC);
+	switch (reg & IXGBE_MRQC_MRQE_MASK) {
+	case IXGBE_MRQC_VMDQRT8TCEN:
+		num_qs = 8;  /* 16 VFs / pools */
+		bitmask = 0x000000FF;
+		break;
+	case IXGBE_MRQC_VMDQRSS32EN:
+	case IXGBE_MRQC_VMDQRT4TCEN:
+		num_qs = 4;  /* 32 VFs / pools */
+		bitmask = 0x0000000F;
+		break;
+	default:            /* 64 VFs / pools */
+		num_qs = 2;
+		bitmask = 0x00000003;
+		break;
+	}
+	start_q = vf * num_qs;
+
+	/* Release vf's queues by clearing WQBR_TX and WQBR_RX (RW1C) */
+	idx = start_q / 32;
+	reg = 0;
+	reg |= (bitmask << (start_q % 32));
+	IXGBE_WRITE_REG(hw, IXGBE_WQBR_TX(idx), reg);
+	IXGBE_WRITE_REG(hw, IXGBE_WQBR_RX(idx), reg);
+}
+
+/**
+ *  ixgbe_mdd_event_X550
+ *  @hw: pointer to hardware structure
+ *  @vf_bitmap: vf bitmap of malicious vfs
+ *
+ *  Handle malicious driver detection event.
+ **/
+static void ixgbe_mdd_event_X550(struct ixgbe_hw *hw, u32 *vf_bitmap)
+{
+	u32 wqbr;
+	u32 i, j, reg, q, shift, vf, idx;
+
+	/* figure out pool size for mapping to vf's */
+	reg = IXGBE_READ_REG(hw, IXGBE_MRQC);
+	switch (reg & IXGBE_MRQC_MRQE_MASK) {
+	case IXGBE_MRQC_VMDQRT8TCEN:
+		shift = 3;  /* 16 VFs / pools */
+		break;
+	case IXGBE_MRQC_VMDQRSS32EN:
+	case IXGBE_MRQC_VMDQRT4TCEN:
+		shift = 2;  /* 32 VFs / pools */
+		break;
+	default:
+		shift = 1;  /* 64 VFs / pools */
+		break;
+	}
+
+	/* Read WQBR_TX and WQBR_RX and check for malicious queues */
+	for (i = 0; i < 4; i++) {
+		wqbr = IXGBE_READ_REG(hw, IXGBE_WQBR_TX(i));
+		wqbr |= IXGBE_READ_REG(hw, IXGBE_WQBR_RX(i));
+
+		if (!wqbr)
+			continue;
+
+		/* Get malicious queue */
+		for (j = 0; j < 32 && wqbr; j++) {
+			if (!(wqbr & (1 << j)))
+				continue;
+
+			/* Get queue from bitmask */
+			q = j + (i * 32);
+
+			/* Map queue to vf */
+			vf = (q >> shift);
+
+			/* Set vf bit in vf_bitmap */
+			idx = vf / 32;
+			vf_bitmap[idx] |= (1 << (vf % 32));
+			wqbr &= ~(1 << j);
+		}
+	}
+}
+
+/**
  *  ixgbe_setup_fc_backplane_x550em_a - Set up flow control
  *  @hw: pointer to hardware structure
  *
@@ -3817,6 +3951,10 @@ static s32 ixgbe_write_phy_reg_x550a(struct ixgbe_hw *hw, u32 reg_addr,
 	.init_thermal_sensor_thresh	= NULL, \
 	.enable_rx			= &ixgbe_enable_rx_generic, \
 	.disable_rx			= &ixgbe_disable_rx_x550, \
+	.enable_mdd                     = &ixgbe_enable_mdd_X550, \
+	.disable_mdd                    = &ixgbe_disable_mdd_X550, \
+	.mdd_event                      = &ixgbe_mdd_event_X550, \
+	.restore_mdd_vf                 = &ixgbe_restore_mdd_vf_X550, \
 
 static const struct ixgbe_mac_operations mac_ops_X550 = {
 	X550_COMMON_MAC

@@ -380,6 +380,8 @@ struct ixgbe_thermal_sensor_data {
 #define IXGBE_MRCTL(_i)      (0x0F600 + ((_i) * 4))
 #define IXGBE_VMRVLAN(_i)    (0x0F610 + ((_i) * 4))
 #define IXGBE_VMRVM(_i)      (0x0F630 + ((_i) * 4))
+#define IXGBE_LVMMC_RX	     0x2FA8
+#define IXGBE_LVMMC_TX	     0x8108
 #define IXGBE_WQBR_RX(_i)    (0x2FB0 + ((_i) * 4)) /* 4 total */
 #define IXGBE_WQBR_TX(_i)    (0x8130 + ((_i) * 4)) /* 4 total */
 #define IXGBE_L34T_IMIR(_i)  (0x0E800 + ((_i) * 4)) /*128 of these (0-127)*/
@@ -3462,6 +3464,12 @@ struct ixgbe_mac_operations {
 	s32 (*dmac_config_tcs)(struct ixgbe_hw *hw);
 	s32 (*read_iosf_sb_reg)(struct ixgbe_hw *, u32, u32, u32 *);
 	s32 (*write_iosf_sb_reg)(struct ixgbe_hw *, u32, u32, u32);
+
+	/* Malicious driver detection */
+	void (*disable_mdd)(struct ixgbe_hw *hw);
+	void (*enable_mdd)(struct ixgbe_hw *hw);
+	void (*mdd_event)(struct ixgbe_hw *hw, u32 *vf_bitmap);
+	void (*restore_mdd_vf)(struct ixgbe_hw *hw, u32 vf);
 };
 
 struct ixgbe_phy_operations {

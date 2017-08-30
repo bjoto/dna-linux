@@ -379,10 +379,22 @@ static u8 ixgbe_dcbnl_set_all(struct net_device *netdev)
 		} else {
 			hw->mac.ops.fc_enable(hw);
 		}
+		/* Disable MDD before updating SRRCTL, because modifying the
+		 * SRRCTL register while the queue is enabled will generate an
+		 * MDD event.
+		 */
+		if ((adapter->num_vfs) && (hw->mac.ops.disable_mdd) &&
+		    (adapter->flags & IXGBE_FLAG_MDD_ENABLED))
+			hw->mac.ops.disable_mdd(hw);
 
 		ixgbe_set_rx_drop_en(adapter);
 
-		ret = DCB_HW_CHG;
+		if ((adapter->num_vfs) && (hw->mac.ops.enable_mdd) &&
+		    (adapter->flags & IXGBE_FLAG_MDD_ENABLED))
+			hw->mac.ops.enable_mdd(hw);
+
+		if (ret != DCB_HW_CHG_RST)
+			ret = DCB_HW_CHG;
 	}
 
 #ifdef IXGBE_FCOE
@@ -634,7 +646,18 @@ static int ixgbe_dcbnl_ieee_setpfc(struct net_device *dev,
 	else
 		err = hw->mac.ops.fc_enable(hw);
 
+	/* Disable MDD before updating SRRCTL, because modifying the SRRCTL
+	 * register while the queue is enabled will generate an MDD event.
+	 */
+	if ((adapter->num_vfs) && (hw->mac.ops.disable_mdd) &&
+	    (adapter->flags & IXGBE_FLAG_MDD_ENABLED))
+		hw->mac.ops.disable_mdd(hw);
+
 	ixgbe_set_rx_drop_en(adapter);
+
+	if ((adapter->num_vfs) && (hw->mac.ops.enable_mdd) &&
+	    (adapter->flags & IXGBE_FLAG_MDD_ENABLED))
+		hw->mac.ops.enable_mdd(hw);
 
 	return err;
 }

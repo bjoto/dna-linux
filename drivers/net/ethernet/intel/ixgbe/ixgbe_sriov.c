@@ -257,6 +257,10 @@ int ixgbe_disable_sriov(struct ixgbe_adapter *adapter)
 	if (!(adapter->flags & IXGBE_FLAG_SRIOV_ENABLED))
 		return 0;
 
+	/* Turn off malicious driver detection */
+	if ((hw->mac.ops.disable_mdd) &&
+	    (!(adapter->flags & IXGBE_FLAG_MDD_ENABLED)))
+		hw->mac.ops.disable_mdd(hw);
 #ifdef CONFIG_PCI_IOV
 	/*
 	 * If our VFs are assigned we cannot shut down SR-IOV
@@ -1295,10 +1299,56 @@ static void ixgbe_rcv_ack_from_vf(struct ixgbe_adapter *adapter, u32 vf)
 		ixgbe_write_mbx(hw, &msg, 1, vf);
 }
 
+static void ixgbe_check_mdd_event(struct ixgbe_adapter *adapter)
+{
+	struct ixgbe_hw *hw = &adapter->hw;
+	u32 vf_bitmap[IXGBE_MDD_Q_BITMAP_DEPTH] = { 0 };
+	u32 j, i;
+	u32 ping;
+
+	if (!hw->mac.ops.mdd_event)
+		return;
+
+	/* Did we have a malicious event */
+	hw->mac.ops.mdd_event(hw, vf_bitmap);
+
+	/* Log any blocked queues and release lock */
+	for (i = 0; i < IXGBE_MDD_Q_BITMAP_DEPTH; i++) {
+		for (j = 0; j < 32 && vf_bitmap[i]; j++) {
+			u32 vf;
+
+			if (!(vf_bitmap[i] & (1 << j)))
+				continue;
+
+			/* The VF that malicious event occurred on */
+			vf = j + (i * 32);
+
+			dev_warn(&adapter->pdev->dev,
+				 "Malicious event on VF %d tx:%x rx:%x\n", vf,
+				 IXGBE_READ_REG(hw, IXGBE_LVMMC_TX),
+				 IXGBE_READ_REG(hw, IXGBE_LVMMC_RX));
+
+			/* restart the vf */
+			if (hw->mac.ops.restore_mdd_vf) {
+				hw->mac.ops.restore_mdd_vf(hw, vf);
+
+				/* get the VF to rebuild its queues */
+				adapter->vfinfo[vf].clear_to_send = 0;
+				ping = IXGBE_PF_CONTROL_MSG |
+				       IXGBE_VT_MSGTYPE_CTS;
+				ixgbe_write_mbx(hw, &ping, 1, vf);
+			}
+		}
+	}
+}
+
 void ixgbe_msg_task(struct ixgbe_adapter *adapter)
 {
 	struct ixgbe_hw *hw = &adapter->hw;
 	u32 vf;
+
+	if (adapter->flags & IXGBE_FLAG_MDD_ENABLED && adapter->vfinfo)
+		ixgbe_check_mdd_event(adapter);
 
 	for (vf = 0; vf < adapter->num_vfs; vf++) {
 		/* process any reset requests */

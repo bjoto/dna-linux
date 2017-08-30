@@ -6113,6 +6113,7 @@ static int ixgbe_sw_init(struct ixgbe_adapter *adapter,
 		adapter->flags &= ~IXGBE_FLAG_DCA_CAPABLE;
 #endif
 		adapter->flags |= IXGBE_FLAG_VXLAN_OFFLOAD_CAPABLE;
+		adapter->flags |= IXGBE_FLAG_MDD_ENABLED;
 		break;
 	default:
 		break;
@@ -7225,6 +7226,11 @@ static void ixgbe_watchdog_link_is_up(struct ixgbe_adapter *adapter)
 
 	netif_carrier_on(netdev);
 	ixgbe_check_vf_rate_limit(adapter);
+
+	/* Turn on malicious driver detection */
+	if ((adapter->num_vfs) && (hw->mac.ops.enable_mdd) &&
+	    (adapter->flags & IXGBE_FLAG_MDD_ENABLED))
+		hw->mac.ops.enable_mdd(hw);
 
 	/* enable transmits */
 	netif_tx_wake_all_queues(adapter->netdev);
