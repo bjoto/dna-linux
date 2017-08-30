@@ -1521,7 +1521,7 @@ checksum_fail:
  *
  * Returns a hash type to be used by skb_set_hash
  **/
-static inline int i40e_ptype_to_htype(u8 ptype)
+static inline enum pkt_hash_types i40e_ptype_to_htype(u8 ptype)
 {
 	struct i40e_rx_ptype_decoded decoded = decode_rx_desc_ptype(ptype);
 
@@ -1825,7 +1825,7 @@ static struct sk_buff *i40e_construct_skb(struct i40e_ring *rx_ring,
 	/* prefetch first cache line of first page */
 	prefetch(xdp->data);
 #if L1_CACHE_BYTES < 128
-	prefetch(xdp->data + L1_CACHE_BYTES);
+	prefetch((void *)(xdp->data + L1_CACHE_BYTES));
 #endif
 
 	/* allocate a skb to store the frags */
