@@ -5665,6 +5665,12 @@ void ixgbe_reset(struct ixgbe_adapter *adapter)
 	if (hw->mac.san_mac_rar_index)
 		hw->mac.ops.set_vmdq_san_mac(hw, VMDQ_P(0));
 
+	/* Clear saved DMA coalescing values except for watchdog_timer */
+	hw->mac.dmac_config.fcoe_en = false;
+	hw->mac.dmac_config.link_speed = 0;
+	hw->mac.dmac_config.fcoe_tc = 0;
+	hw->mac.dmac_config.num_tcs = 0;
+
 	if (test_bit(__IXGBE_PTP_RUNNING, &adapter->state))
 		ixgbe_ptp_reset(adapter);
 
@@ -7119,6 +7125,23 @@ static void ixgbe_watchdog_update_link(struct ixgbe_adapter *adapter)
 
 	adapter->link_up = link_up;
 	adapter->link_speed = link_speed;
+
+	if (hw->mac.ops.dmac_config && hw->mac.dmac_config.watchdog_timer) {
+		u8 num_tcs = netdev_get_num_tc(adapter->netdev);
+		u8 fcoe_tc = ixgbe_fcoe_get_tc(adapter);
+		bool fcoe_en = !!(adapter->flags & IXGBE_FLAG_FCOE_ENABLED);
+
+		if (hw->mac.dmac_config.link_speed != link_speed ||
+		    hw->mac.dmac_config.fcoe_tc != fcoe_tc ||
+		    hw->mac.dmac_config.fcoe_en != fcoe_en ||
+		    hw->mac.dmac_config.num_tcs != num_tcs) {
+			hw->mac.dmac_config.link_speed = link_speed;
+			hw->mac.dmac_config.num_tcs = num_tcs;
+			hw->mac.dmac_config.fcoe_en = fcoe_en;
+			hw->mac.dmac_config.fcoe_tc = fcoe_tc;
+			hw->mac.ops.dmac_config(hw);
+		}
+	}
 }
 
 static void ixgbe_update_default_up(struct ixgbe_adapter *adapter)

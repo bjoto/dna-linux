@@ -326,6 +326,7 @@ struct ixgbe_thermal_sensor_data {
 #define IXGBE_RXCTRL    0x03000
 #define IXGBE_DROPEN    0x03D04
 #define IXGBE_RXPBSIZE_SHIFT 10
+#define IXGBE_RXPBSIZE_MASK	0x000FFC00
 
 /* Receive Registers */
 #define IXGBE_RXCSUM    0x05000
@@ -572,6 +573,40 @@ struct ixgbe_thermal_sensor_data {
 #define IXGBE_TDTQ2TCSR(_i)     (0x0622C + ((_i) * 0x40)) /* 8 of these (0-7) */
 #define IXGBE_TDPT2TCCR(_i)     (0x0CD20 + ((_i) * 4)) /* 8 of these (0-7) */
 #define IXGBE_TDPT2TCSR(_i)     (0x0CD40 + ((_i) * 4)) /* 8 of these (0-7) */
+
+/* DMA Coalescing configuration */
+struct ixgbe_dmac_config {
+	u16	watchdog_timer; /* usec units */
+	bool	fcoe_en;
+	u32	link_speed;
+	u8	fcoe_tc;
+	u8	num_tcs;
+};
+
+/* DMA Coalescing threshold Rx PB TC[n] value in Kilobyte by link speed.
+ * DMACRXT = 10Gbps = 10,000 bits / usec = 1250 bytes / usec 70 * 1250 ==
+ * 87500 bytes [85KB]
+ */
+#define IXGBE_DMACRXT_10G		0x55
+#define IXGBE_DMACRXT_1G		0x09
+#define IXGBE_DMACRXT_100M		0x01
+
+/* DMA Coalescing registers */
+#define IXGBE_DMCMNGTH			0x15F20 /* Management Threshold */
+#define IXGBE_DMACR			0x02400 /* Control register */
+#define IXGBE_DMCTH(_i)			(0x03300 + ((_i) * 4)) /* 8 of these */
+#define IXGBE_DMCTLX			0x02404 /* Time to Lx request */
+/* DMA Coalescing register fields */
+#define IXGBE_DMCMNGTH_DMCMNGTH_MASK	0x000FFFF0 /* Mng Threshold mask */
+#define IXGBE_DMCMNGTH_DMCMNGTH_SHIFT	4 /* Management Threshold shift */
+#define IXGBE_DMACR_DMACWT_MASK		0x0000FFFF /* Watchdog Timer mask */
+#define IXGBE_DMACR_HIGH_PRI_TC_MASK	0x00FF0000
+#define IXGBE_DMACR_HIGH_PRI_TC_SHIFT	16
+#define IXGBE_DMACR_EN_MNG_IND		0x10000000 /* Enable Mng Indications */
+#define IXGBE_DMACR_LX_COAL_IND		0x40000000 /* Lx Coalescing indicate */
+#define IXGBE_DMACR_DMAC_EN		0x80000000 /* DMA Coalescing Enable */
+#define IXGBE_DMCTH_DMACRXT_MASK	0x000001FF /* Receive Threshold mask */
+#define IXGBE_DMCTLX_TTLX_MASK		0x00000FFF /* Time to Lx request mask */
 
 /* Security Control Registers */
 #define IXGBE_SECTXCTRL         0x08800
@@ -3460,7 +3495,6 @@ struct ixgbe_mac_operations {
 
 	/* DMA Coalescing */
 	s32 (*dmac_config)(struct ixgbe_hw *hw);
-	s32 (*dmac_update_tcs)(struct ixgbe_hw *hw);
 	s32 (*dmac_config_tcs)(struct ixgbe_hw *hw);
 	s32 (*read_iosf_sb_reg)(struct ixgbe_hw *, u32, u32, u32 *);
 	s32 (*write_iosf_sb_reg)(struct ixgbe_hw *, u32, u32, u32);
@@ -3553,6 +3587,7 @@ struct ixgbe_mac_info {
 	u8                              flags;
 	u8				san_mac_rar_index;
 	struct ixgbe_thermal_sensor_data  thermal_sensor_data;
+	struct ixgbe_dmac_config	dmac_config;
 	bool				set_lben;
 	u8				led_link_act;
 };

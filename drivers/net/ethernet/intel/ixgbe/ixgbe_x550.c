@@ -639,6 +639,106 @@ static s32 ixgbe_fc_autoneg_fw(struct ixgbe_hw *hw)
 	return ixgbe_setup_fw_link(hw);
 }
 
+/**
+ *  ixgbe_dmac_config_tcs_X550
+ *  @hw: pointer to hardware structure
+ *
+ *  Configure DMA coalescing threshold per TC. The dmac enable bit must
+ *  be cleared before configuring.
+ **/
+static s32 ixgbe_dmac_config_tcs_X550(struct ixgbe_hw *hw)
+{
+	u32 tc, reg, pb_headroom, rx_pb_size, maxframe_size_kb;
+
+	/* Configure DMA coalescing enabled */
+	switch (hw->mac.dmac_config.link_speed) {
+	case IXGBE_LINK_SPEED_10_FULL:
+	case IXGBE_LINK_SPEED_100_FULL:
+		pb_headroom = IXGBE_DMACRXT_100M;
+		break;
+	case IXGBE_LINK_SPEED_1GB_FULL:
+		pb_headroom = IXGBE_DMACRXT_1G;
+		break;
+	default:
+		pb_headroom = IXGBE_DMACRXT_10G;
+		break;
+	}
+
+	maxframe_size_kb = ((IXGBE_READ_REG(hw, IXGBE_MAXFRS) >>
+			     IXGBE_MHADD_MFS_SHIFT) / 1024);
+
+	/* Set the per Rx packet buffer receive threshold */
+	for (tc = 0; tc < MAX_TRAFFIC_CLASS; tc++) {
+		reg = IXGBE_READ_REG(hw, IXGBE_DMCTH(tc));
+		reg &= ~IXGBE_DMCTH_DMACRXT_MASK;
+
+		if (tc < hw->mac.dmac_config.num_tcs) {
+			/* Get Rx PB size */
+			rx_pb_size = IXGBE_READ_REG(hw, IXGBE_RXPBSIZE(tc));
+			rx_pb_size = (rx_pb_size & IXGBE_RXPBSIZE_MASK) >>
+				IXGBE_RXPBSIZE_SHIFT;
+
+			/* Calculate receive buffer threshold in kilobytes */
+			if (rx_pb_size > pb_headroom)
+				rx_pb_size = rx_pb_size - pb_headroom;
+			else
+				rx_pb_size = 0;
+
+			/* Minimum of MFS shall be set for DMCTH */
+			reg |= (rx_pb_size > maxframe_size_kb) ?
+				rx_pb_size : maxframe_size_kb;
+		}
+		IXGBE_WRITE_REG(hw, IXGBE_DMCTH(tc), reg);
+	}
+	return 0;
+}
+
+/**
+ *  ixgbe_dmac_config_X550
+ *  @hw: pointer to hardware structure
+ *
+ *  Configure DMA coalescing. If enabling dmac, dmac is activated.
+ *  When disabling dmac, dmac enable dmac bit is cleared.
+ **/
+static s32 ixgbe_dmac_config_X550(struct ixgbe_hw *hw)
+{
+	u32 reg, high_pri_tc;
+
+	/* Disable DMA coalescing before configuring */
+	reg = IXGBE_READ_REG(hw, IXGBE_DMACR);
+	reg &= ~IXGBE_DMACR_DMAC_EN;
+	IXGBE_WRITE_REG(hw, IXGBE_DMACR, reg);
+
+	/* Disable DMA Coalescing if the watchdog timer is 0 */
+	if (!hw->mac.dmac_config.watchdog_timer)
+		goto out;
+
+	ixgbe_dmac_config_tcs_X550(hw);
+
+	/* Configure DMA Coalescing Control Register */
+	reg = IXGBE_READ_REG(hw, IXGBE_DMACR);
+
+	/* Set the watchdog timer in units of 40.96 usec */
+	reg &= ~IXGBE_DMACR_DMACWT_MASK;
+	reg |= (hw->mac.dmac_config.watchdog_timer * 100) / 4096;
+
+	reg &= ~IXGBE_DMACR_HIGH_PRI_TC_MASK;
+	/* If fcoe is enabled, set high priority traffic class */
+	if (hw->mac.dmac_config.fcoe_en) {
+		high_pri_tc = 1 << hw->mac.dmac_config.fcoe_tc;
+		reg |= ((high_pri_tc << IXGBE_DMACR_HIGH_PRI_TC_SHIFT) &
+			IXGBE_DMACR_HIGH_PRI_TC_MASK);
+	}
+	reg |= IXGBE_DMACR_EN_MNG_IND;
+
+	/* Enable DMA coalescing after configuration */
+	reg |= IXGBE_DMACR_DMAC_EN;
+	IXGBE_WRITE_REG(hw, IXGBE_DMACR, reg);
+
+out:
+	return 0;
+}
+
 /** ixgbe_init_eeprom_params_X550 - Initialize EEPROM params
  *  @hw: pointer to hardware structure
  *
@@ -3955,6 +4055,8 @@ static s32 ixgbe_write_phy_reg_x550a(struct ixgbe_hw *hw, u32 reg_addr,
 	.disable_mdd                    = &ixgbe_disable_mdd_X550, \
 	.mdd_event                      = &ixgbe_mdd_event_X550, \
 	.restore_mdd_vf                 = &ixgbe_restore_mdd_vf_X550, \
+	.dmac_config			= &ixgbe_dmac_config_X550, \
+	.dmac_config_tcs		= &ixgbe_dmac_config_tcs_X550, \
 
 static const struct ixgbe_mac_operations mac_ops_X550 = {
 	X550_COMMON_MAC

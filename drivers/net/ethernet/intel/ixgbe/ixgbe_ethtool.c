@@ -2289,6 +2289,8 @@ static int ixgbe_get_coalesce(struct net_device *netdev,
 {
 	struct ixgbe_adapter *adapter = netdev_priv(netdev);
 
+	ec->dmac = adapter->hw.mac.dmac_config.watchdog_timer;
+
 	/* only valid if in constant ITR mode */
 	if (adapter->rx_itr_setting <= 1)
 		ec->rx_coalesce_usecs = adapter->rx_itr_setting;
@@ -2342,10 +2344,12 @@ static int ixgbe_set_coalesce(struct net_device *netdev,
 			      struct ethtool_coalesce *ec)
 {
 	struct ixgbe_adapter *adapter = netdev_priv(netdev);
+	struct ixgbe_hw *hw = &adapter->hw;
 	struct ixgbe_q_vector *q_vector;
-	int i;
 	u16 tx_itr_param, rx_itr_param, tx_itr_prev;
 	bool need_reset = false;
+	u16 dmac_prev;
+	int i;
 
 	if (adapter->q_vector[0]->tx.count && adapter->q_vector[0]->rx.count) {
 		/* reject Tx specific changes in case of mixed RxTx vectors */
@@ -2394,6 +2398,24 @@ static int ixgbe_set_coalesce(struct net_device *netdev,
 		if ((tx_itr_prev != 1) &&
 		    (tx_itr_prev < IXGBE_100K_ITR))
 			need_reset = true;
+	}
+
+	if (ec->dmac != IXGBE_DMACWT_DISABLE &&
+	    (ec->dmac < IXGBE_DMACWT_MIN || ec->dmac > IXGBE_DMACWT_MAX))
+		return -EINVAL;
+
+	if (hw->mac.ops.dmac_config) {
+		dmac_prev = hw->mac.dmac_config.watchdog_timer;
+		hw->mac.dmac_config.watchdog_timer = ec->dmac;
+
+		/* Disable DMAC if interrupt throttling is disabled */
+		if (hw->mac.dmac_config.watchdog_timer &&
+		    (!adapter->rx_itr_setting && !adapter->tx_itr_setting)) {
+			hw->mac.dmac_config.watchdog_timer = 0;
+			hw->mac.ops.dmac_config(&adapter->hw);
+		} else if (hw->mac.dmac_config.watchdog_timer != dmac_prev) {
+			hw->mac.ops.dmac_config(&adapter->hw);
+		}
 	}
 
 	/* check the old value and enable RSC if necessary */

@@ -507,6 +507,11 @@ struct hwmon_buff {
 #define IXGBE_20K_ITR		200
 #define IXGBE_12K_ITR		336
 
+/* DMA coalecing watchdog timer interval in usecs */
+#define IXGBE_DMACWT_DISABLE	0
+#define IXGBE_DMACWT_MIN	41
+#define IXGBE_DMACWT_MAX	10000
+
 /* ixgbe_test_staterr - tests bits in Rx descriptor status and error fields */
 static inline __le32 ixgbe_test_staterr(union ixgbe_adv_rx_desc *rx_desc,
 					const u32 stat_err_bits)
@@ -942,6 +947,11 @@ int ixgbe_fcoe_get_wwn(struct net_device *netdev, u64 *wwn, int type);
 int ixgbe_fcoe_get_hbainfo(struct net_device *netdev,
 			   struct netdev_fcoe_hbainfo *info);
 u8 ixgbe_fcoe_get_tc(struct ixgbe_adapter *adapter);
+#else
+static inline u8 ixgbe_fcoe_get_tc(struct ixgbe_adapter *adapter)
+{
+	return 0;
+}
 #endif /* IXGBE_FCOE */
 #ifdef CONFIG_DEBUG_FS
 void ixgbe_dbg_adapter_init(struct ixgbe_adapter *adapter);
